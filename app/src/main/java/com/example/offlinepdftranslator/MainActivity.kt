@@ -1,8 +1,14 @@
 package com.example.offlinepdftranslator
 
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,11 +34,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import java.io.OutputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // PdfBox 초기화 (필수)
         PDFBoxResourceLoader.init(applicationContext)
 
         setContent {
@@ -54,7 +60,6 @@ fun OfflinePdfTranslatorScreen() {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    // 지원하는 주요 다중 언어 목록 (ML Kit 오프라인 모델)
     val languages = remember {
         listOf(
             "한국어" to TranslateLanguage.KOREAN,
@@ -96,19 +101,23 @@ fun OfflinePdfTranslatorScreen() {
         }
     }
 
-    // 2. 번역본 내보내기(저장) 런처
+    // 2. 번역본 PDF로 내보내기 런처
     val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("text/plain")
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { saveUri: Uri? ->
         if (saveUri != null && translatedResultText.isNotEmpty()) {
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     context.contentResolver.openOutputStream(saveUri)?.use { outputStream ->
-                        outputStream.write(translatedResultText.toByteArray(Charsets.UTF_8))
+                        createFormattedPdf(
+                            title = selectedFileName.removeSuffix(".pdf") + " (번역본)",
+                            content = translatedResultText,
+                            outputStream = outputStream
+                        )
                     }
                     withContext(Dispatchers.Main) {
-                        statusMessage = "✅ 번역본 내보내기 완료!"
-                        Toast.makeText(context, "파일이 성공적으로 저장되었습니다.", Toast.LENGTH_LONG).show()
+                        statusMessage = "✅ PDF 번역본 내보내기 완료!"
+                        Toast.makeText(context, "PDF 파일이 성공적으로 저장되었습니다.", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
@@ -173,7 +182,7 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        // [버튼 2] 번역 실행 및 번역본 내보내기
+        // [버튼 2] 번역 실행 및 PDF로 내보내기
         Button(
             onClick = {
                 val uri = selectedPdfUri
@@ -189,7 +198,6 @@ fun OfflinePdfTranslatorScreen() {
                 coroutineScope.launch {
                     isProcessing = true
                     try {
-                        // 1단계: 오프라인 언어 모델 확인 및 다운로드 (최초 1회만 인터넷 필요)
                         statusMessage = "오프라인 언어팩 확인 중...\n(최초 1회만 다운로드되며 이후 오프라인 작동)"
                         val options = TranslatorOptions.Builder()
                             .setSourceLanguage(sourceLang.second)
@@ -200,7 +208,6 @@ fun OfflinePdfTranslatorScreen() {
                         val conditions = DownloadConditions.Builder().build()
                         translator.downloadModelIfNeeded(conditions).await()
 
-                        // 2단계: PDF에서 텍스트 추출
                         statusMessage = "PDF에서 텍스트 추출 중..."
                         val extractedText = withContext(Dispatchers.IO) {
                             context.contentResolver.openInputStream(uri)?.use { inputStream ->
@@ -216,7 +223,6 @@ fun OfflinePdfTranslatorScreen() {
                             return@launch
                         }
 
-                        // 3단계: 문단 단위 오프라인 번역 진행
                         statusMessage = "오프라인 번역 진행 중..."
                         val paragraphs = extractedText.split("\n\n").filter { it.isNotBlank() }
                         val translatedBuilder = StringBuilder()
@@ -230,9 +236,8 @@ fun OfflinePdfTranslatorScreen() {
                         translator.close()
                         translatedResultText = translatedBuilder.toString()
 
-                        // 4단계: 저장 위치 선택 창 띄우기
-                        statusMessage = "번역 완료! 저장할 위치를 선택하세요."
-                        val exportFileName = selectedFileName.removeSuffix(".pdf") + "_번역본.txt"
+                        statusMessage = "번역 완료! PDF 저장 위치를 선택하세요."
+                        val exportFileName = selectedFileName.removeSuffix(".pdf") + "_번역본.pdf"
                         exportLauncher.launch(exportFileName)
 
                     } catch (e: Exception) {
@@ -247,7 +252,7 @@ fun OfflinePdfTranslatorScreen() {
                 .height(56.dp),
             enabled = !isProcessing && selectedPdfUri != null
         ) {
-            Text(text = "2. 번역본 내보내기", fontSize = 16.sp)
+            Text(text = "2. PDF 번역본 내보내기", fontSize = 16.sp)
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -262,6 +267,89 @@ fun OfflinePdfTranslatorScreen() {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
+}
+
+/**
+ * 번역된 텍스트를 깔끔한 A4 규격의 서식 있는 PDF 문서로 생성하는 함수
+ */
+fun createFormattedPdf(title: String, content: String, outputStream: OutputStream) {
+    val pdfDocument = PdfDocument()
+    // A4 표준 포인트 규격 (595 x 842)
+    val pageWidth = 595
+    val pageHeight = 842
+    val margin = 50f
+    val contentWidth = (pageWidth - margin * 2).toInt()
+
+    val titlePaint = TextPaint().apply {
+        color = Color.BLACK
+        textSize = 16f
+        isFakeBoldText = true
+    }
+
+    val bodyPaint = TextPaint().apply {
+        color = Color.DKGRAY
+        textSize = 11f
+    }
+
+    val footerPaint = Paint().apply {
+        color = Color.GRAY
+        textSize = 9f
+        textAlign = Paint.Align.CENTER
+    }
+
+    // 전체 본문 레이아웃 계산 (자동 줄바꿈 처리)
+    val staticLayout = StaticLayout.Builder.obtain(
+        content, 0, content.length, bodyPaint, contentWidth
+    )
+        .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+        .setLineSpacing(4f, 1.2f)
+        .build()
+
+    var currentLine = 0
+    var pageNumber = 1
+
+    while (currentLine < staticLayout.lineCount) {
+        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
+        val page = pdfDocument.startPage(pageInfo)
+        val canvas = page.canvas
+
+        var currentY = margin
+
+        // 첫 페이지 상단에는 문서 제목과 구분선 추가
+        if (pageNumber == 1) {
+            canvas.drawText(title, margin, currentY + 14f, titlePaint)
+            currentY += 32f
+            canvas.drawLine(margin, currentY, pageWidth - margin, currentY, footerPaint)
+            currentY += 20f
+        }
+
+        val maxContentY = pageHeight - margin - 20f
+
+        // 현재 페이지에 들어갈 수 있는 만큼 줄 단위로 그리기
+        while (currentLine < staticLayout.lineCount) {
+            val lineHeight = (staticLayout.getLineBottom(currentLine) - staticLayout.getLineTop(currentLine)).toFloat()
+            if (currentY + lineHeight > maxContentY) {
+                break // 다음 페이지로 넘김
+            }
+
+            val lineStart = staticLayout.getLineStart(currentLine)
+            val lineEnd = staticLayout.getLineEnd(currentLine)
+            val lineText = content.substring(lineStart, lineEnd)
+
+            canvas.drawText(lineText, margin, currentY + lineHeight - 4f, bodyPaint)
+            currentY += lineHeight
+            currentLine++
+        }
+
+        // 하단 페이지 번호 표시
+        canvas.drawText("- $pageNumber -", pageWidth / 2f, pageHeight - 25f, footerPaint)
+
+        pdfDocument.finishPage(page)
+        pageNumber++
+    }
+
+    pdfDocument.writeTo(outputStream)
+    pdfDocument.close()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
