@@ -1,21 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!-- 최초 언어 모델 다운로드를 위한 인터넷 권한 (다운로드 후엔 오프라인 작동) -->
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <application
-        android:allowBackup="true"
-        android:label="오프라인 PDF 번역기"
-        android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
+​<!-- 최초 언어 모델 다운로드를 위한 인터넷 권한 (다운로드 후엔 오프라인 작동) -->
+<uses-permission android:name="android.permission.INTERNET" />
+​<!-- 백그라운드 번역 및 상단 알림바 진행률 표시 권한 (Android 13/14+ 필수) -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+​<application
+android:allowBackup="true"
+android:label="오프라인 PDF 번역기"
+android:supportsRtl="true"
+android:theme="@android:style/Theme.Material.Light.NoActionBar">
+<activity
+android:name=".MainActivity"
+android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.MAIN" />
+<category android:name="android.intent.category.LAUNCHER" />
+</intent-filter>
+</activity>
+​<!-- 백그라운드 번역 전담 서비스 등록 -->
+<service
+android:name=".TranslationService"
+android:exported="false"
+android:foregroundServiceType="dataSync" />
+</application>
 </manifest>
