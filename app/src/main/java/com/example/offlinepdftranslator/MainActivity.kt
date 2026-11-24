@@ -1,14 +1,12 @@
 package com.example.offlinepdftranslator
 
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.pdf.PdfDocument
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.text.Layout
-import android.text.StaticLayout
-import android.text.TextPaint
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -21,26 +19,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.mlkit.common.model.DownloadConditions
+import androidx.core.content.ContextCompat
 import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import java.io.OutputStream
-
-data class TranslatedParagraph(
-    val text: String,
-    val isHeading: Boolean
-)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,6 +53,9 @@ fun OfflinePdfTranslatorScreen() {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
+    // 백그라운드 서비스의 진행 상태를 실시간으로 구독
+    val progressState by TranslationService.progressState.collectAsState()
+
     val languages = remember {
         listOf(
             "한국어" to TranslateLanguage.KOREAN,
@@ -85,10 +75,29 @@ fun OfflinePdfTranslatorScreen() {
     var selectedFileName by remember { mutableStateOf("선택된 파일 없음") }
     var sourceLang by remember { mutableStateOf(languages[1]) } // 기본값: 영어
     var targetLang by remember { mutableStateOf(languages[0]) } // 기본값: 한국어
-    var isProcessing by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf("PDF 파일을 가져온 뒤 언어를 선택해 주세요.") }
-    var translatedPages by remember { mutableStateOf<List<List<TranslatedParagraph>>>(emptyList()) }
+    var localStatus by remember { mutableStateOf("PDF 파일을 가져온 뒤 언어를 선택해 주세요.") }
 
+    // Android 13/14+ 알림 권한 요청 런처
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(context, "알림 권한이 거부되어 상단바 진행률이 표시되지 않을 수 있습니다.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // 앱 시작 시 알림 권한 확인 (갤럭시 S24 울트라 등 최신 기기 필수)
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    // 1. PDF 파일 가져오기 런처
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -102,33 +111,52 @@ fun OfflinePdfTranslatorScreen() {
                 }
             }
             selectedFileName = name
-            statusMessage = "파일 준비 완료. 번역본 내보내기를 누르세요."
+            TranslationService.resetCompletion()
+            localStatus = "파일 준비 완료. '번역 시작'을 누르면 백그라운드에서 진행됩니다."
         }
     }
 
+    // 2. 번역 완료된 PDF 저장 런처
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { saveUri: Uri? ->
-        if (saveUri != null && translatedPages.isNotEmpty()) {
+        val pagesToSave = TranslationService.completedPages
+        if (saveUri != null && pagesToSave.isNotEmpty()) {
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     context.contentResolver.openOutputStream(saveUri)?.use { outputStream ->
                         createStructuredPdf(
-                            pages = translatedPages,
+                            pages = pagesToSave,
                             outputStream = outputStream
                         )
                     }
                     withContext(Dispatchers.Main) {
-                        statusMessage = "✅ 문장 어순 최적화 PDF 번역본 내보내기 완료!"
+                        localStatus = "✅ PDF 번역본 저장 완료!"
+                        TranslationService.resetCompletion()
                         Toast.makeText(context, "PDF 파일이 성공적으로 저장되었습니다.", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
-                        statusMessage = "❌ 저장 실패: ${e.message}"
+                        localStatus = "❌ 저장 실패: ${e.message}"
                     }
                 }
             }
         }
+    }
+
+    // 번역이 완료되면 자동으로 저장 다이얼로그 띄우기
+    LaunchedEffect(progressState.isCompleted) {
+        if (progressState.isCompleted && TranslationService.completedPages.isNotEmpty()) {
+            val baseName = progressState.fileName.ifEmpty { selectedFileName }.removeSuffix(".pdf")
+            exportLauncher.launch("${baseName}_번역본.pdf")
+        }
+    }
+
+    val isProcessing = progressState.isRunning
+    val displayStatus = if (isProcessing || progressState.isCompleted) {
+        progressState.statusMessage
+    } else {
+        localStatus
     }
 
     Column(
@@ -145,6 +173,7 @@ fun OfflinePdfTranslatorScreen() {
             modifier = Modifier.padding(bottom = 32.dp)
         )
 
+        // [버튼 1] PDF 파일 가져오기
         Button(
             onClick = { pdfPickerLauncher.launch(arrayOf("application/pdf")) },
             modifier = Modifier
@@ -162,6 +191,7 @@ fun OfflinePdfTranslatorScreen() {
             modifier = Modifier.padding(top = 8.dp, bottom = 28.dp)
         )
 
+        // [언어 선택] 번역할 언어 (원본)
         LanguageDropdown(
             label = "번역할 언어 (원본)",
             languages = languages,
@@ -172,6 +202,7 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        // [언어 선택] 번역될 언어 (결과)
         LanguageDropdown(
             label = "번역될 언어 (결과)",
             languages = languages,
@@ -182,8 +213,15 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(32.dp))
 
+        // [버튼 2] 백그라운드 번역 시작 / 완료 시 PDF 저장하기
         Button(
             onClick = {
+                if (progressState.isCompleted && TranslationService.completedPages.isNotEmpty()) {
+                    val baseName = progressState.fileName.ifEmpty { selectedFileName }.removeSuffix(".pdf")
+                    exportLauncher.launch("${baseName}_번역본.pdf")
+                    return@Button
+                }
+
                 val uri = selectedPdfUri
                 if (uri == null) {
                     Toast.makeText(context, "먼저 PDF 파일을 가져와 주세요.", Toast.LENGTH_SHORT).show()
@@ -194,269 +232,58 @@ fun OfflinePdfTranslatorScreen() {
                     return@Button
                 }
 
-                coroutineScope.launch {
-                    isProcessing = true
-                    try {
-                        statusMessage = "오프라인 언어팩 확인 중...\n(최초 1회만 다운로드되며 이후 오프라인 작동)"
-                        val options = TranslatorOptions.Builder()
-                            .setSourceLanguage(sourceLang.second)
-                            .setTargetLanguage(targetLang.second)
-                            .build()
-                        val translator = Translation.getClient(options)
-
-                        val conditions = DownloadConditions.Builder().build()
-                        translator.downloadModelIfNeeded(conditions).await()
-
-                        statusMessage = "PDF 텍스트 정제 및 문장 구조 분석 중..."
-                        val rawPages = withContext(Dispatchers.IO) {
-                            extractPagesFromPdf(context, uri)
-                        }
-
-                        if (rawPages.all { it.isBlank() }) {
-                            statusMessage = "❌ 텍스트를 추출할 수 없습니다. (스캔된 이미지 PDF일 수 있습니다)"
-                            isProcessing = false
-                            return@launch
-                        }
-
-                        val resultPages = mutableListOf<List<TranslatedParagraph>>()
-
-                        for ((pageIdx, pageText) in rawPages.withIndex()) {
-                            statusMessage = "오프라인 문장 단위 번역 중... (${pageIdx + 1} / ${rawPages.size} 페이지)"
-                            val cleanedText = cleanEnglishPdfNoise(pageText)
-                            val parsedParagraphs = splitIntoSmartParagraphs(cleanedText)
-                            val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
-
-                            for ((rawPara, isHeading) in parsedParagraphs) {
-                                // 글자 수 제한 없이 온전한 문장(. ? !) 단위로 쪼개어 번역
-                                val translatedText = translateByCompleteSentences(translator, rawPara)
-                                translatedPageParagraphs.add(
-                                    TranslatedParagraph(
-                                        text = translatedText,
-                                        isHeading = isHeading
-                                    )
-                                )
-                            }
-                            resultPages.add(translatedPageParagraphs)
-                        }
-
-                        translator.close()
-                        translatedPages = resultPages
-
-                        statusMessage = "번역 완료! PDF 저장 위치를 선택하세요."
-                        val exportFileName = selectedFileName.removeSuffix(".pdf") + "_번역본.pdf"
-                        exportLauncher.launch(exportFileName)
-
-                    } catch (e: Exception) {
-                        statusMessage = "❌ 오류 발생: ${e.localizedMessage}\n(최초 실행 시 언어팩 다운로드를 위해 인터넷 연결이 필요합니다)"
-                    } finally {
-                        isProcessing = false
-                    }
+                // 백그라운드 서비스 시작
+                val serviceIntent = Intent(context, TranslationService::class.java).apply {
+                    putExtra(TranslationService.EXTRA_PDF_URI, uri.toString())
+                    putExtra(TranslationService.EXTRA_FILE_NAME, selectedFileName)
+                    putExtra(TranslationService.EXTRA_SOURCE_LANG, sourceLang.second)
+                    putExtra(TranslationService.EXTRA_TARGET_LANG, targetLang.second)
                 }
+                ContextCompat.startForegroundService(context, serviceIntent)
+                Toast.makeText(context, "백그라운드에서 번역을 시작합니다. 상단 알림바에서 진행률을 확인하세요.", Toast.LENGTH_LONG).show()
             },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
-            enabled = !isProcessing && selectedPdfUri != null
+            enabled = !isProcessing && (selectedPdfUri != null || progressState.isCompleted)
         ) {
-            Text(text = "2. PDF 번역본 내보내기", fontSize = 16.sp)
+            Text(
+                text = if (progressState.isCompleted) "2. 번역본 PDF 저장하기" else "2. 백그라운드 번역 및 내보내기",
+                fontSize = 16.sp
+            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
 
+        // 진행률 프로그레스 바 표시
         if (isProcessing) {
-            CircularProgressIndicator(modifier = Modifier.padding(bottom = 12.dp))
+            if (progressState.totalPages > 0) {
+                val progressRatio = progressState.currentPage.toFloat() / progressState.totalPages.toFloat()
+                LinearProgressIndicator(
+                    progress = { progressRatio },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp)
+                        .padding(bottom = 8.dp)
+                )
+            } else {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp)
+                        .padding(bottom = 8.dp)
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
         }
 
         Text(
-            text = statusMessage,
+            text = displayStatus,
             fontSize = 14.sp,
+            textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
-}
-
-/**
- * 영어 PDF 특유의 특수 합자, 줄끝 하이픈, 페이지 번호 노이즈를 정제하는 함수
- */
-fun cleanEnglishPdfNoise(rawText: String): String {
-    var text = rawText
-        .replace("ﬁ", "fi")
-        .replace("ﬂ", "fl")
-        .replace("ﬀ", "ff")
-        .replace("ﬃ", "ffi")
-        .replace("ﬄ", "ffl")
-        .replace("•", "- ")
-        .replace("■", "- ")
-        .replace("▪", "- ")
-
-    // 줄 끝 하이픈으로 끊긴 영단어 복원
-    text = text.replace(Regex("([a-zA-Z])-\\s*\\n\\s*([a-zA-Z])"), "$1$2")
-
-    // 단독 숫자만 있는 줄(페이지 번호 등) 제거
-    val filteredLines = text.lines().filter { line ->
-        val trimmed = line.trim()
-        !trimmed.matches(Regex("^[-–—]?\\s*\\d+\\s*[-–—]?$"))
-    }
-
-    return filteredLines.joinToString("\n")
-}
-
-/**
- * 글자 수로 자르지 않고 오직 마침표(.), 물음표(?), 느낌표(!) 기준의
- * 완전한 1문장 단위로만 분리해 어순을 완벽하게 살려 번역하는 함수
- */
-suspend fun translateByCompleteSentences(translator: Translator, paragraph: String): String {
-    // 약어(Mr., Mrs., Ms., Dr., Prof., e.g., i.e., vs., etc.) 뒤의 마침표에서는 문장이 잘리지 않도록 보호
-    val protectedText = paragraph.replace(
-        Regex("\\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\\.g|i\\.e)\\.", RegexOption.IGNORE_CASE)
-    ) { matchResult ->
-        matchResult.value.replace(".", "###DOT###")
-    }
-
-    // . ? ! (닫는 따옴표/괄호 포함 가능) 뒤의 공백을 기준으로 완전한 문장 분리
-    val rawSentences = protectedText.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
-        .map { it.replace("###DOT###", ".").trim() }
-        .filter { it.isNotEmpty() }
-
-    if (rawSentences.isEmpty()) {
-        return translator.translate(paragraph).await()
-    }
-
-    val translatedSentences = mutableListOf<String>()
-    for (sentence in rawSentences) {
-        val translated = translator.translate(sentence).await()
-        translatedSentences.add(translated.trim())
-    }
-
-    return translatedSentences.joinToString(" ")
-}
-
-fun extractPagesFromPdf(context: android.content.Context, uri: Uri): List<String> {
-    val pages = mutableListOf<String>()
-    context.contentResolver.openInputStream(uri)?.use { inputStream ->
-        PDDocument.load(inputStream).use { document ->
-            val stripper = PDFTextStripper().apply {
-                sortByPosition = true
-                paragraphEnd = "\n\n"
-            }
-            for (pageNum in 1..document.numberOfPages) {
-                stripper.startPage = pageNum
-                stripper.endPage = pageNum
-                pages.add(stripper.getText(document))
-            }
-        }
-    }
-    return pages
-}
-
-fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
-    val result = mutableListOf<Pair<String, Boolean>>()
-    val lines = pageText.lines()
-    val currentBuffer = StringBuilder()
-
-    for (line in lines) {
-        val trimmed = line.trim()
-        if (trimmed.isEmpty()) {
-            if (currentBuffer.isNotEmpty()) {
-                val para = currentBuffer.toString().trim()
-                val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-                result.add(para to isHeading)
-                currentBuffer.clear()
-            }
-        } else {
-            if (currentBuffer.isNotEmpty()) currentBuffer.append(" ")
-            currentBuffer.append(trimmed)
-
-            if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) {
-                val para = currentBuffer.toString().trim()
-                if (para.length > 100) {
-                    result.add(para to false)
-                    currentBuffer.clear()
-                }
-            }
-        }
-    }
-
-    if (currentBuffer.isNotEmpty()) {
-        val para = currentBuffer.toString().trim()
-        val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-        result.add(para to isHeading)
-    }
-
-    return result
-}
-
-fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: OutputStream) {
-    val pdfDocument = PdfDocument()
-    val pageWidth = 595
-    val pageHeight = 842
-    val margin = 48f
-    val contentWidth = (pageWidth - margin * 2).toInt()
-    val maxContentHeight = pageHeight - margin * 2 - 20f
-
-    val footerPaint = Paint().apply {
-        color = Color.GRAY
-        textSize = 9f
-        textAlign = Paint.Align.CENTER
-    }
-
-    for ((pageIndex, paragraphs) in pages.withIndex()) {
-        val pageNumber = pageIndex + 1
-        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
-        val page = pdfDocument.startPage(pageInfo)
-        val canvas = page.canvas
-
-        var fontSize = 10.5f
-        var layouts: List<Pair<StaticLayout, Boolean>> = emptyList()
-
-        while (fontSize >= 7.5f) {
-            var totalHeight = 0f
-            val tempLayouts = mutableListOf<Pair<StaticLayout, Boolean>>()
-
-            for (para in paragraphs) {
-                val paint = TextPaint().apply {
-                    color = if (para.isHeading) Color.BLACK else Color.DKGRAY
-                    textSize = if (para.isHeading) fontSize + 2f else fontSize
-                    isFakeBoldText = para.isHeading
-                }
-                val layout = StaticLayout.Builder.obtain(
-                    para.text, 0, para.text.length, paint, contentWidth
-                )
-                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                    .setLineSpacing(2f, 1.15f)
-                    .build()
-
-                val spacingAfter = if (para.isHeading) fontSize * 0.8f else fontSize * 1.1f
-                totalHeight += layout.height + spacingAfter
-                tempLayouts.add(layout to para.isHeading)
-            }
-
-            layouts = tempLayouts
-            if (totalHeight <= maxContentHeight) {
-                break
-            }
-            fontSize -= 0.5f
-        }
-
-        var currentY = margin
-        for ((layout, isHeading) in layouts) {
-            if (currentY + layout.height > pageHeight - margin - 15f) break
-
-            canvas.save()
-            canvas.translate(margin, currentY)
-            layout.draw(canvas)
-            canvas.restore()
-
-            val spacingAfter = if (isHeading) fontSize * 0.8f else fontSize * 1.1f
-            currentY += layout.height + spacingAfter
-        }
-
-        canvas.drawText("- $pageNumber / ${pages.size} -", pageWidth / 2f, pageHeight - 24f, footerPaint)
-        pdfDocument.finishPage(page)
-    }
-
-    pdfDocument.writeTo(outputStream)
-    pdfDocument.close()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
