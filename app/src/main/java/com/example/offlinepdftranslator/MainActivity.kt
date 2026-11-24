@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -36,7 +37,6 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.io.OutputStream
 
-// 단락 정보를 담는 데이터 클래스
 data class TranslatedParagraph(
     val text: String,
     val isHeading: Boolean
@@ -87,11 +87,8 @@ fun OfflinePdfTranslatorScreen() {
     var targetLang by remember { mutableStateOf(languages[0]) } // 기본값: 한국어
     var isProcessing by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("PDF 파일을 가져온 뒤 언어를 선택해 주세요.") }
-    
-    // 페이지별 > 단락별 번역 결과를 저장하는 리스트
     var translatedPages by remember { mutableStateOf<List<List<TranslatedParagraph>>>(emptyList()) }
 
-    // 1. PDF 파일 가져오기 런처
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -109,7 +106,6 @@ fun OfflinePdfTranslatorScreen() {
         }
     }
 
-    // 2. 번역본 PDF로 내보내기 런처
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { saveUri: Uri? ->
@@ -123,7 +119,7 @@ fun OfflinePdfTranslatorScreen() {
                         )
                     }
                     withContext(Dispatchers.Main) {
-                        statusMessage = "✅ 단락 및 페이지 맞춤 PDF 내보내기 완료!"
+                        statusMessage = "✅ 문장 어순 최적화 PDF 번역본 내보내기 완료!"
                         Toast.makeText(context, "PDF 파일이 성공적으로 저장되었습니다.", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
@@ -149,7 +145,6 @@ fun OfflinePdfTranslatorScreen() {
             modifier = Modifier.padding(bottom = 32.dp)
         )
 
-        // [버튼 1] PDF 파일 가져오기
         Button(
             onClick = { pdfPickerLauncher.launch(arrayOf("application/pdf")) },
             modifier = Modifier
@@ -167,7 +162,6 @@ fun OfflinePdfTranslatorScreen() {
             modifier = Modifier.padding(top = 8.dp, bottom = 28.dp)
         )
 
-        // [언어 선택] 번역할 언어 (원본)
         LanguageDropdown(
             label = "번역할 언어 (원본)",
             languages = languages,
@@ -178,7 +172,6 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // [언어 선택] 번역될 언어 (결과)
         LanguageDropdown(
             label = "번역될 언어 (결과)",
             languages = languages,
@@ -189,7 +182,6 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        // [버튼 2] 번역 실행 및 PDF로 내보내기
         Button(
             onClick = {
                 val uri = selectedPdfUri
@@ -215,7 +207,7 @@ fun OfflinePdfTranslatorScreen() {
                         val conditions = DownloadConditions.Builder().build()
                         translator.downloadModelIfNeeded(conditions).await()
 
-                        statusMessage = "PDF 페이지 및 단락 분석 중..."
+                        statusMessage = "PDF 텍스트 정제 및 문장 구조 분석 중..."
                         val rawPages = withContext(Dispatchers.IO) {
                             extractPagesFromPdf(context, uri)
                         }
@@ -229,12 +221,14 @@ fun OfflinePdfTranslatorScreen() {
                         val resultPages = mutableListOf<List<TranslatedParagraph>>()
 
                         for ((pageIdx, pageText) in rawPages.withIndex()) {
-                            statusMessage = "오프라인 번역 중... (${pageIdx + 1} / ${rawPages.size} 페이지)"
-                            val parsedParagraphs = splitIntoSmartParagraphs(pageText)
+                            statusMessage = "오프라인 문장 단위 번역 중... (${pageIdx + 1} / ${rawPages.size} 페이지)"
+                            val cleanedText = cleanEnglishPdfNoise(pageText)
+                            val parsedParagraphs = splitIntoSmartParagraphs(cleanedText)
                             val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
 
                             for ((rawPara, isHeading) in parsedParagraphs) {
-                                val translatedText = translator.translate(rawPara).await()
+                                // 글자 수 제한 없이 온전한 문장(. ? !) 단위로 쪼개어 번역
+                                val translatedText = translateByCompleteSentences(translator, rawPara)
                                 translatedPageParagraphs.add(
                                     TranslatedParagraph(
                                         text = translatedText,
@@ -282,14 +276,67 @@ fun OfflinePdfTranslatorScreen() {
 }
 
 /**
- * PDF를 페이지 단위로 텍스트 추출
+ * 영어 PDF 특유의 특수 합자, 줄끝 하이픈, 페이지 번호 노이즈를 정제하는 함수
  */
+fun cleanEnglishPdfNoise(rawText: String): String {
+    var text = rawText
+        .replace("ﬁ", "fi")
+        .replace("ﬂ", "fl")
+        .replace("ﬀ", "ff")
+        .replace("ﬃ", "ffi")
+        .replace("ﬄ", "ffl")
+        .replace("•", "- ")
+        .replace("■", "- ")
+        .replace("▪", "- ")
+
+    // 줄 끝 하이픈으로 끊긴 영단어 복원
+    text = text.replace(Regex("([a-zA-Z])-\\s*\\n\\s*([a-zA-Z])"), "$1$2")
+
+    // 단독 숫자만 있는 줄(페이지 번호 등) 제거
+    val filteredLines = text.lines().filter { line ->
+        val trimmed = line.trim()
+        !trimmed.matches(Regex("^[-–—]?\\s*\\d+\\s*[-–—]?$"))
+    }
+
+    return filteredLines.joinToString("\n")
+}
+
+/**
+ * 글자 수로 자르지 않고 오직 마침표(.), 물음표(?), 느낌표(!) 기준의
+ * 완전한 1문장 단위로만 분리해 어순을 완벽하게 살려 번역하는 함수
+ */
+suspend fun translateByCompleteSentences(translator: Translator, paragraph: String): String {
+    // 약어(Mr., Mrs., Ms., Dr., Prof., e.g., i.e., vs., etc.) 뒤의 마침표에서는 문장이 잘리지 않도록 보호
+    val protectedText = paragraph.replace(
+        Regex("\\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\\.g|i\\.e)\\.", RegexOption.IGNORE_CASE)
+    ) { matchResult ->
+        matchResult.value.replace(".", "###DOT###")
+    }
+
+    // . ? ! (닫는 따옴표/괄호 포함 가능) 뒤의 공백을 기준으로 완전한 문장 분리
+    val rawSentences = protectedText.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
+        .map { it.replace("###DOT###", ".").trim() }
+        .filter { it.isNotEmpty() }
+
+    if (rawSentences.isEmpty()) {
+        return translator.translate(paragraph).await()
+    }
+
+    val translatedSentences = mutableListOf<String>()
+    for (sentence in rawSentences) {
+        val translated = translator.translate(sentence).await()
+        translatedSentences.add(translated.trim())
+    }
+
+    return translatedSentences.joinToString(" ")
+}
+
 fun extractPagesFromPdf(context: android.content.Context, uri: Uri): List<String> {
     val pages = mutableListOf<String>()
     context.contentResolver.openInputStream(uri)?.use { inputStream ->
         PDDocument.load(inputStream).use { document ->
             val stripper = PDFTextStripper().apply {
-                sortByPosition = true // 시각적 배치 순서대로 정렬
+                sortByPosition = true
                 paragraphEnd = "\n\n"
             }
             for (pageNum in 1..document.numberOfPages) {
@@ -302,9 +349,6 @@ fun extractPagesFromPdf(context: android.content.Context, uri: Uri): List<String
     return pages
 }
 
-/**
- * PDF 특유의 강제 줄바꿈을 복원하고 제목/본문 단락을 구분하는 함수
- */
 fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
     val result = mutableListOf<Pair<String, Boolean>>()
     val lines = pageText.lines()
@@ -315,24 +359,17 @@ fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
         if (trimmed.isEmpty()) {
             if (currentBuffer.isNotEmpty()) {
                 val para = currentBuffer.toString().trim()
-                val isHeading = para.length < 45 && !para.endsWith(".") && !para.endsWith("。")
+                val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
                 result.add(para to isHeading)
                 currentBuffer.clear()
             }
         } else {
-            // 하이픈으로 단어가 잘린 경우 연결
-            if (currentBuffer.endsWith("-")) {
-                currentBuffer.deleteCharAt(currentBuffer.length - 1)
-                currentBuffer.append(trimmed)
-            } else {
-                if (currentBuffer.isNotEmpty()) currentBuffer.append(" ")
-                currentBuffer.append(trimmed)
-            }
+            if (currentBuffer.isNotEmpty()) currentBuffer.append(" ")
+            currentBuffer.append(trimmed)
 
-            // 마침표 등으로 문장이 명확히 끝나고 다음 줄이 새 단락일 가능성이 높을 때 분리
-            if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?") || trimmed.endsWith("。")) {
+            if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) {
                 val para = currentBuffer.toString().trim()
-                if (para.length > 80) { // 충분히 긴 문단이면 단락 확정
+                if (para.length > 100) {
                     result.add(para to false)
                     currentBuffer.clear()
                 }
@@ -342,16 +379,13 @@ fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
 
     if (currentBuffer.isNotEmpty()) {
         val para = currentBuffer.toString().trim()
-        val isHeading = para.length < 45 && !para.endsWith(".") && !para.endsWith("。")
+        val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
         result.add(para to isHeading)
     }
 
     return result
 }
 
-/**
- * 원본 페이지 수와 단락 간격을 유지하여 A4 규격 PDF로 생성하는 함수
- */
 fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: OutputStream) {
     val pdfDocument = PdfDocument()
     val pageWidth = 595
@@ -372,7 +406,6 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
         val page = pdfDocument.startPage(pageInfo)
         val canvas = page.canvas
 
-        // 한 페이지에 모든 단락이 알맞게 들어가도록 폰트 크기 자동 조절 (10.5pt ~ 7.5pt)
         var fontSize = 10.5f
         var layouts: List<Pair<StaticLayout, Boolean>> = emptyList()
 
@@ -400,12 +433,11 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
 
             layouts = tempLayouts
             if (totalHeight <= maxContentHeight) {
-                break // 현재 페이지 안에 깔끔하게 들어감
+                break
             }
             fontSize -= 0.5f
         }
 
-        // 계산된 레이아웃을 캔버스에 그리기
         var currentY = margin
         for ((layout, isHeading) in layouts) {
             if (currentY + layout.height > pageHeight - margin - 15f) break
@@ -419,7 +451,6 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
             currentY += layout.height + spacingAfter
         }
 
-        // 하단 원본 페이지 번호 표시
         canvas.drawText("- $pageNumber / ${pages.size} -", pageWidth / 2f, pageHeight - 24f, footerPaint)
         pdfDocument.finishPage(page)
     }
