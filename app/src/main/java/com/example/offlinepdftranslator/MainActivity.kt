@@ -57,7 +57,6 @@ fun OfflinePdfTranslatorScreen() {
 
     val progressState by TranslationService.progressState.collectAsState()
 
-    // 생성형 AI(LLM)는 프롬프트 기반이므로 거의 모든 주요 언어를 자유롭게 지원합니다
     val languages = remember {
         listOf(
             "한국어" to "Korean",
@@ -73,7 +72,6 @@ fun OfflinePdfTranslatorScreen() {
         )
     }
 
-    // 앱 내부 저장소에 이미 복사된 AI 모델이 있는지 확인
     var savedModelPath by remember {
         val existingModel = File(context.filesDir, "llm_model.task")
         mutableStateOf(if (existingModel.exists() && existingModel.length() > 10_000_000L) existingModel.absolutePath else null)
@@ -92,7 +90,6 @@ fun OfflinePdfTranslatorScreen() {
     var targetLang by remember { mutableStateOf(languages[0]) } // 기본값: 한국어
     var localStatus by remember { mutableStateOf("AI 모델 등록 후 PDF 파일을 가져와 주세요.") }
 
-    // Android 13/14+ 알림 권한 요청 런처
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -111,7 +108,7 @@ fun OfflinePdfTranslatorScreen() {
         }
     }
 
-    // [런처 0] 온디바이스 AI 모델 파일(.task / .bin) 등록 런처 (최초 1회만 등록하면 영구 보존)
+    // [런처 0] 온디바이스 AI 모델 파일(.task / .bin) 등록 런처
     val modelPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
