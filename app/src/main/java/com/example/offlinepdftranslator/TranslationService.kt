@@ -122,8 +122,6 @@ class TranslationService : Service() {
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(modelPath)
                 .setMaxTokens(1024)
-                .setTemperature(0.2f) // 번역의 정확성과 일관성을 위해 낮은 온도 설정
-                .setTopK(40)
                 .build()
 
             llmInference = LlmInference.createFromOptions(applicationContext, options)
