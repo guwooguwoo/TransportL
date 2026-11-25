@@ -113,11 +113,11 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "1단계: PDF 텍스트 추출 및 단락 병합 중...",
+                statusMessage = "1단계: PDF 텍스트 추출 및 챕터/섹션 단위로 병합 중...",
                 isCompleted = false,
                 fileName = fileName
             )
-            updateNotification("PDF 분석 중...", fileName, 0, 0, true)
+            updateNotification("PDF 챕터 분석 중...", fileName, 0, 0, true)
 
             val rawPages = extractPagesFromPdf(applicationContext, uri)
 
@@ -132,25 +132,25 @@ class TranslationService : Service() {
                 return
             }
 
+            // 페이지별 텍스트를 정제한 뒤, 챕터/섹션 단위로 크게 병합 (최대 1,400자씩 꽉 채움)
             val allParsedPages = rawPages.map { pageText ->
                 val cleanedText = cleanEnglishPdfNoise(pageText)
-                splitIntoSmartParagraphs(cleanedText)
+                groupIntoChapterBlocks(cleanedText, maxBlockChars = 1400)
             }
 
             val totalPages = allParsedPages.size
-            val totalParagraphsAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
+            val totalBlocksAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
 
             updateState(
                 isRunning = true,
-                statusMessage = "2단계: S24 울트라 GPU 고속 모드 로딩 중... (총 ${totalPages}쪽)"
+                statusMessage = "2단계: S24 울트라 GPU 엔진 로딩 중... (총 ${totalPages}쪽 → ${totalBlocksAll}개 대단위 블록으로 압축)"
             )
-            updateNotification("AI 고속 모델 로딩 중...", "잠시만 기다려 주세요 (약 5초)", 0, totalParagraphsAll, true)
+            updateNotification("AI 모델 로딩 중...", "잠시만 기다려 주세요 (약 5초)", 0, totalBlocksAll, true)
 
-            // 고속 번역을 위한 GPU + Greedy(topK=1, temp=0) 옵션 설정
             llmInference = try {
                 val gpuOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(1024)
+                    .setMaxTokens(1280)
                     .setTopK(1)
                     .setTemperature(0.0f)
                     .setPreferredBackend(LlmInference.Backend.GPU)
@@ -159,63 +159,75 @@ class TranslationService : Service() {
             } catch (gpuEx: Throwable) {
                 val defaultOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(1024)
+                    .setMaxTokens(1280)
                     .setTopK(1)
                     .setTemperature(0.0f)
                     .build()
                 LlmInference.createFromOptions(applicationContext, defaultOptions)
             }
 
-            var processedParagraphsCount = 0
+            var processedBlocksCount = 0
             val resultPages = mutableListOf<List<TranslatedParagraph>>()
 
-            for ((pageIdx, parsedParagraphs) in allParsedPages.withIndex()) {
+            for ((pageIdx, chapterBlocks) in allParsedPages.withIndex()) {
                 val currentPageNum = pageIdx + 1
                 val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
 
-                if (parsedParagraphs.isEmpty()) {
+                if (chapterBlocks.isEmpty()) {
                     resultPages.add(emptyList())
                     continue
                 }
 
-                for ((paraIdx, pair) in parsedParagraphs.withIndex()) {
-                    val (rawPara, isHeading) = pair
-                    val percent = ((processedParagraphsCount.toFloat() / totalParagraphsAll) * 100).toInt()
-                    val statusDetail = "고속 AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 묶음 ${paraIdx + 1}/${parsedParagraphs.size})"
+                for ((blockIdx, pair) in chapterBlocks.withIndex()) {
+                    val (rawBlock, isHeading) = pair
+                    val percent = ((processedBlocksCount.toFloat() / totalBlocksAll) * 100).toInt()
+                    val statusDetail = "챕터 단위 AI 통번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 블록 ${blockIdx + 1}/${chapterBlocks.size})"
 
                     updateState(
                         isRunning = true,
                         statusMessage = statusDetail,
-                        currentPage = processedParagraphsCount,
-                        totalPages = totalParagraphsAll
+                        currentPage = processedBlocksCount,
+                        totalPages = totalBlocksAll
                     )
                     updateNotification(
-                        title = "AI 번역 진행 중 ($percent%)",
-                        content = "$currentPageNum/${totalPages}쪽 · 묶음 ${paraIdx + 1}/${parsedParagraphs.size} 처리 중",
-                        progress = processedParagraphsCount,
-                        max = totalParagraphsAll,
+                        title = "AI 챕터 통번역 중 ($percent%)",
+                        content = "$currentPageNum/${totalPages}쪽 · 블록 ${blockIdx + 1}/${chapterBlocks.size} 통번역 중...",
+                        progress = processedBlocksCount,
+                        max = totalBlocksAll,
                         indeterminate = false
                     )
 
-                    // 번역할 문자가 없는 단순 숫자/기호 줄은 AI 호출 스킵
-                    val translatedText = if (!rawPara.any { it.isLetter() }) {
-                        rawPara
+                    val translatedText = if (!rawBlock.any { it.isLetter() }) {
+                        rawBlock
                     } else {
-                        translateParagraphWithLlm(
+                        translateBlockWithLlm(
                             llm = llmInference!!,
-                            paragraph = rawPara,
+                            blockText = rawBlock,
                             sourceLang = sourceLang,
                             targetLang = targetLang
                         )
                     }
 
-                    translatedPageParagraphs.add(
-                        TranslatedParagraph(
-                            text = translatedText.ifBlank { rawPara },
-                            isHeading = isHeading
-                        )
-                    )
-                    processedParagraphsCount++
+                    // 번역된 블록 내의 줄바꿈(\n\n)을 살려 깔끔한 문단들로 복원
+                    val subParagraphs = translatedText.ifBlank { rawBlock }
+                        .split(Regex("\\n{2,}"))
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+
+                    if (subParagraphs.isEmpty()) {
+                        translatedPageParagraphs.add(TranslatedParagraph(rawBlock, isHeading))
+                    } else {
+                        subParagraphs.forEachIndexed { idx, subPara ->
+                            translatedPageParagraphs.add(
+                                TranslatedParagraph(
+                                    text = subPara,
+                                    isHeading = isHeading && idx == 0
+                                )
+                            )
+                        }
+                    }
+
+                    processedBlocksCount++
                 }
                 resultPages.add(translatedPageParagraphs)
             }
@@ -224,9 +236,9 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = false,
-                statusMessage = "✅ 고품질 AI 번역 완료! (100%) 아래 버튼을 눌러 PDF를 저장하세요.",
-                currentPage = totalParagraphsAll,
-                totalPages = totalParagraphsAll,
+                statusMessage = "✅ 고품질 AI 챕터 통번역 완료! (100%) 아래 버튼을 눌러 PDF를 저장하세요.",
+                currentPage = totalBlocksAll,
+                totalPages = totalBlocksAll,
                 isCompleted = true,
                 fileName = fileName
             )
@@ -235,8 +247,8 @@ class TranslationService : Service() {
             updateNotification(
                 title = "✅ AI PDF 번역 완료 (100%)",
                 content = "총 ${totalPages}페이지 번역 완료! 앱을 열어 PDF를 저장하세요.",
-                progress = totalParagraphsAll,
-                max = totalParagraphsAll,
+                progress = totalBlocksAll,
+                max = totalBlocksAll,
                 indeterminate = false,
                 ongoing = false
             )
@@ -258,69 +270,99 @@ class TranslationService : Service() {
         }
     }
 
-    private fun translateParagraphWithLlm(
+    private fun translateBlockWithLlm(
         llm: LlmInference,
-        paragraph: String,
+        blockText: String,
         sourceLang: String,
         targetLang: String
     ): String {
-        // 호출 횟수를 최소화하기 위해 650자 단위로 큼직하게 묶어서 한 번에 번역
-        val chunks = splitIntoSafeChunks(paragraph, maxChars = 650)
-        val resultBuilder = StringBuilder()
+        val prompt = "<|im_start|>user\nTranslate the following $sourceLang text into natural, fluent $targetLang. Keep paragraph breaks. Output ONLY the translation:\n$blockText<|im_end|>\n<|im_start|>assistant\n"
 
-        for (chunk in chunks) {
-            if (chunk.isBlank()) continue
-
-            // 토큰 절약을 위한 초경량 프롬프트
-            val prompt = "<|im_start|>user\nTranslate $sourceLang to $targetLang (only output translation):\n$chunk<|im_end|>\n<|im_start|>assistant\n"
-
-            val rawResponse = llm.generateResponse(prompt)
-            val cleanedResponse = rawResponse
-                .replace("<|im_end|>", "")
-                .replace("<|endoftext|>", "")
-                .replace(Regex("^(Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
-                .trim()
-
-            if (resultBuilder.isNotEmpty()) resultBuilder.append(" ")
-            resultBuilder.append(cleanedResponse)
-        }
-
-        return resultBuilder.toString().trim()
+        val rawResponse = llm.generateResponse(prompt)
+        return rawResponse
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+            .replace(Regex("^(Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
+            .trim()
     }
 
-    private fun splitIntoSafeChunks(text: String, maxChars: Int): List<String> {
-        if (text.length <= maxChars) return listOf(text)
+    /**
+     * 페이지 내 텍스트를 챕터 제목(Heading) 기준으로 나누되,
+     * 일반 본문은 모델 한계치(1,400자)까지 여러 단락을 한 덩어리로 꽉 채워 호출 횟수를 극단적으로 줄입니다.
+     */
+    private fun groupIntoChapterBlocks(pageText: String, maxBlockChars: Int): List<Pair<String, Boolean>> {
+        val rawParagraphs = mutableListOf<Pair<String, Boolean>>()
+        val lines = pageText.lines()
+        val lineBuffer = StringBuilder()
 
-        val sentences = text.split(Regex("(?<=[.?!;][\"'”’)\\]]?)\\s+"))
-        val chunks = mutableListOf<String>()
-        val buffer = StringBuilder()
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.isEmpty()) {
+                if (lineBuffer.isNotEmpty()) {
+                    val para = lineBuffer.toString().trim()
+                    val isHeading = para.length < 60 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
+                    rawParagraphs.add(para to isHeading)
+                    lineBuffer.clear()
+                }
+            } else {
+                if (lineBuffer.isNotEmpty()) lineBuffer.append(" ")
+                lineBuffer.append(trimmed)
+            }
+        }
+        if (lineBuffer.isNotEmpty()) {
+            val para = lineBuffer.toString().trim()
+            val isHeading = para.length < 60 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
+            rawParagraphs.add(para to isHeading)
+        }
 
-        for (sentence in sentences) {
-            if (sentence.length > maxChars) {
-                if (buffer.isNotEmpty()) {
-                    chunks.add(buffer.toString().trim())
-                    buffer.clear()
-                }
-                var idx = 0
-                while (idx < sentence.length) {
-                    val end = (idx + maxChars).coerceAtMost(sentence.length)
-                    chunks.add(sentence.substring(idx, end).trim())
-                    idx = end
-                }
-                continue
+        // 이제 추출된 단락들을 챕터/대단위 블록(최대 1,400자)으로 묶음
+        val chapterBlocks = mutableListOf<Pair<String, Boolean>>()
+        val blockBuffer = StringBuilder()
+        var blockStartsWithHeading = false
+
+        for ((para, isHeading) in rawParagraphs) {
+            // 새로운 챕터 제목이 등장하면 기존에 모인 본문을 먼저 확정
+            if (isHeading && blockBuffer.isNotEmpty()) {
+                chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
+                blockBuffer.clear()
+                blockStartsWithHeading = false
             }
 
-            if (buffer.isNotEmpty() && buffer.length + sentence.length > maxChars) {
-                chunks.add(buffer.toString().trim())
-                buffer.clear()
+            // 현재 단락을 더했을 때 maxBlockChars(1,400자)를 넘으면 기존 블록을 먼저 확정
+            if (blockBuffer.isNotEmpty() && blockBuffer.length + para.length > maxBlockChars) {
+                chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
+                blockBuffer.clear()
+                blockStartsWithHeading = false
             }
-            if (buffer.isNotEmpty()) buffer.append(" ")
-            buffer.append(sentence)
+
+            if (blockBuffer.isEmpty()) {
+                blockStartsWithHeading = isHeading
+            } else {
+                blockBuffer.append("\n\n")
+            }
+
+            // 단락 하나 자체가 1,400자보다 긴 경우에만 문장 끝(.!?) 기준으로 분할
+            if (para.length > maxBlockChars) {
+                val sentences = para.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
+                for (sentence in sentences) {
+                    if (blockBuffer.isNotEmpty() && blockBuffer.length + sentence.length > maxBlockChars) {
+                        chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
+                        blockBuffer.clear()
+                        blockStartsWithHeading = false
+                    }
+                    if (blockBuffer.isNotEmpty()) blockBuffer.append(" ")
+                    blockBuffer.append(sentence)
+                }
+            } else {
+                blockBuffer.append(para)
+            }
         }
-        if (buffer.isNotEmpty()) {
-            chunks.add(buffer.toString().trim())
+
+        if (blockBuffer.isNotEmpty()) {
+            chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
         }
-        return chunks
+
+        return chapterBlocks
     }
 
     private fun updateState(
@@ -447,42 +489,6 @@ fun extractPagesFromPdf(context: Context, uri: Uri): List<String> {
         }
     }
     return pages
-}
-
-fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
-    val result = mutableListOf<Pair<String, Boolean>>()
-    val lines = pageText.lines()
-    val currentBuffer = StringBuilder()
-
-    for (line in lines) {
-        val trimmed = line.trim()
-        if (trimmed.isEmpty()) {
-            if (currentBuffer.isNotEmpty()) {
-                val para = currentBuffer.toString().trim()
-                val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-                result.add(para to isHeading)
-                currentBuffer.clear()
-            }
-        } else {
-            if (currentBuffer.isNotEmpty()) currentBuffer.append(" ")
-            currentBuffer.append(trimmed)
-
-            // 450자 이상 모였을 때만 단락을 분리해 AI 호출 횟수 대폭 감소
-            if ((trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) && currentBuffer.length > 450) {
-                val para = currentBuffer.toString().trim()
-                result.add(para to false)
-                currentBuffer.clear()
-            }
-        }
-    }
-
-    if (currentBuffer.isNotEmpty()) {
-        val para = currentBuffer.toString().trim()
-        val isHeading = para.length < 50 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-        result.add(para to isHeading)
-    }
-
-    return result
 }
 
 fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: OutputStream) {
