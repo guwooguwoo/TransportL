@@ -1,4 +1,3 @@
-```kotlin
 package com.example.offlinepdftranslator
 
 import android.app.Notification
@@ -524,4 +523,3 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
     pdfDocument.writeTo(outputStream)
     pdfDocument.close()
 }
-```
