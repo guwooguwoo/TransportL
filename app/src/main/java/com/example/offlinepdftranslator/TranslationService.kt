@@ -169,7 +169,15 @@ class TranslationService : Service() {
                 val parsedParagraphs = splitIntoSmartParagraphs(cleanedText)
                 val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
 
-                for ((rawPara, isHeading) in parsedParagraphs) {
+                for ((paraIdx, pair) in parsedParagraphs.withIndex()) {
+                    val (rawPara, isHeading) = pair
+                    updateState(
+                        isRunning = true,
+                        statusMessage = "AI 번역 중... ($currentPageNum/$totalPages 페이지 - 단락 ${paraIdx + 1}/${parsedParagraphs.size})",
+                        currentPage = currentPageNum,
+                        totalPages = totalPages
+                    )
+
                     val translatedText = translateParagraphWithLlm(
                         llm = llmInference,
                         paragraph = rawPara,
@@ -178,7 +186,7 @@ class TranslationService : Service() {
                     )
                     translatedPageParagraphs.add(
                         TranslatedParagraph(
-                            text = translatedText,
+                            text = translatedText.ifBlank { rawPara },
                             isHeading = isHeading
                         )
                     )
@@ -208,18 +216,18 @@ class TranslationService : Service() {
             )
             stopSelf()
 
-        } catch (e: Exception) {
+        } catch (t: Throwable) {
             updateState(
                 isRunning = false,
-                statusMessage = "❌ AI 실행 오류: ${e.localizedMessage}\n(MediaPipe 호환 .task 또는 .bin 모델인지 확인해 주세요)"
+                statusMessage = "❌ AI 실행 오류: ${t.javaClass.simpleName} - ${t.localizedMessage ?: "알 수 없는 오류"}"
             )
             stopForeground(STOP_FOREGROUND_DETACH)
-            updateNotification("번역 중 오류 발생", e.localizedMessage ?: "알 수 없는 오류", 0, 0, false, ongoing = false)
+            updateNotification("번역 중 오류 발생", t.localizedMessage ?: "알 수 없는 오류", 0, 0, false, ongoing = false)
             stopSelf()
         } finally {
             try {
                 llmInference?.close()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
     }
@@ -230,23 +238,24 @@ class TranslationService : Service() {
         sourceLang: String,
         targetLang: String
     ): String {
-        val chunks = splitIntoSafeChunks(paragraph, maxChars = 500)
+        val chunks = splitIntoSafeChunks(paragraph, maxChars = 400)
         val resultBuilder = StringBuilder()
 
         for (chunk in chunks) {
+            // Qwen2.5 Instruct 전용 ChatML 템플릿 적용
             val prompt = buildString {
-                append("You are a professional native translator.\n")
-                append("Translate the following $sourceLang text into natural, fluent $targetLang.\n")
-                append("Rules:\n")
-                append("1. Adapt the sentence structure and word order naturally for $targetLang readers.\n")
-                append("2. Output ONLY the translated text without any explanations, notes, or quotes.\n\n")
-                append("Text:\n")
+                append("<|im_start|>system\n")
+                append("You are a professional native translator. Translate the given $sourceLang text into natural, fluent $targetLang. Output ONLY the translated text without any explanations, notes, or quotes.<|im_end|>\n")
+                append("<|im_start|>user\n")
                 append(chunk)
-                append("\n\nTranslation:")
+                append("<|im_end|>\n")
+                append("<|im_start|>assistant\n")
             }
 
             val rawResponse = llm.generateResponse(prompt)
             val cleanedResponse = rawResponse
+                .replace("<|im_end|>", "")
+                .replace("<|endoftext|>", "")
                 .replace(Regex("^(Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
                 .trim()
 
