@@ -113,7 +113,7 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "1단계: PDF 텍스트 추출 및 단락 분석 중...",
+                statusMessage = "1단계: PDF 텍스트 추출 및 단락 병합 중...",
                 isCompleted = false,
                 fileName = fileName
             )
@@ -142,22 +142,26 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "2단계: S24 울트라 GPU AI 엔진 로딩 중... (총 ${totalPages}쪽, ${totalParagraphsAll}개 단락)"
+                statusMessage = "2단계: S24 울트라 GPU 고속 모드 로딩 중... (총 ${totalPages}쪽)"
             )
-            updateNotification("AI 모델 로딩 중...", "GPU 엔진에 모델을 올리고 있습니다 (약 5초)", 0, totalParagraphsAll, true)
+            updateNotification("AI 고속 모델 로딩 중...", "잠시만 기다려 주세요 (약 5초)", 0, totalParagraphsAll, true)
 
-            // multi-prefill-seq GPU 전용 모델을 위해 Backend.GPU 설정 (자동 폴백 포함)
+            // 고속 번역을 위한 GPU + Greedy(topK=1, temp=0) 옵션 설정
             llmInference = try {
                 val gpuOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(512)
+                    .setMaxTokens(1024)
+                    .setTopK(1)
+                    .setTemperature(0.0f)
                     .setPreferredBackend(LlmInference.Backend.GPU)
                     .build()
                 LlmInference.createFromOptions(applicationContext, gpuOptions)
             } catch (gpuEx: Throwable) {
                 val defaultOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(512)
+                    .setMaxTokens(1024)
+                    .setTopK(1)
+                    .setTemperature(0.0f)
                     .build()
                 LlmInference.createFromOptions(applicationContext, defaultOptions)
             }
@@ -177,7 +181,7 @@ class TranslationService : Service() {
                 for ((paraIdx, pair) in parsedParagraphs.withIndex()) {
                     val (rawPara, isHeading) = pair
                     val percent = ((processedParagraphsCount.toFloat() / totalParagraphsAll) * 100).toInt()
-                    val statusDetail = "AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 단락 ${paraIdx + 1}/${parsedParagraphs.size})"
+                    val statusDetail = "고속 AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 묶음 ${paraIdx + 1}/${parsedParagraphs.size})"
 
                     updateState(
                         isRunning = true,
@@ -187,18 +191,24 @@ class TranslationService : Service() {
                     )
                     updateNotification(
                         title = "AI 번역 진행 중 ($percent%)",
-                        content = "$currentPageNum/${totalPages}쪽 · 단락 ${paraIdx + 1}/${parsedParagraphs.size} 처리 중",
+                        content = "$currentPageNum/${totalPages}쪽 · 묶음 ${paraIdx + 1}/${parsedParagraphs.size} 처리 중",
                         progress = processedParagraphsCount,
                         max = totalParagraphsAll,
                         indeterminate = false
                     )
 
-                    val translatedText = translateParagraphWithLlm(
-                        llm = llmInference!!,
-                        paragraph = rawPara,
-                        sourceLang = sourceLang,
-                        targetLang = targetLang
-                    )
+                    // 번역할 문자가 없는 단순 숫자/기호 줄은 AI 호출 스킵
+                    val translatedText = if (!rawPara.any { it.isLetter() }) {
+                        rawPara
+                    } else {
+                        translateParagraphWithLlm(
+                            llm = llmInference!!,
+                            paragraph = rawPara,
+                            sourceLang = sourceLang,
+                            targetLang = targetLang
+                        )
+                    }
+
                     translatedPageParagraphs.add(
                         TranslatedParagraph(
                             text = translatedText.ifBlank { rawPara },
@@ -254,13 +264,15 @@ class TranslationService : Service() {
         sourceLang: String,
         targetLang: String
     ): String {
-        val chunks = splitIntoSafeChunks(paragraph, maxChars = 180)
+        // 호출 횟수를 최소화하기 위해 650자 단위로 큼직하게 묶어서 한 번에 번역
+        val chunks = splitIntoSafeChunks(paragraph, maxChars = 650)
         val resultBuilder = StringBuilder()
 
         for (chunk in chunks) {
             if (chunk.isBlank()) continue
 
-            val prompt = "<|im_start|>user\nTranslate this $sourceLang text into natural $targetLang. Output ONLY the translation:\n$chunk<|im_end|>\n<|im_start|>assistant\n"
+            // 토큰 절약을 위한 초경량 프롬프트
+            val prompt = "<|im_start|>user\nTranslate $sourceLang to $targetLang (only output translation):\n$chunk<|im_end|>\n<|im_start|>assistant\n"
 
             val rawResponse = llm.generateResponse(prompt)
             val cleanedResponse = rawResponse
@@ -455,12 +467,11 @@ fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
             if (currentBuffer.isNotEmpty()) currentBuffer.append(" ")
             currentBuffer.append(trimmed)
 
-            if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) {
+            // 450자 이상 모였을 때만 단락을 분리해 AI 호출 횟수 대폭 감소
+            if ((trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) && currentBuffer.length > 450) {
                 val para = currentBuffer.toString().trim()
-                if (para.length > 120) {
-                    result.add(para to false)
-                    currentBuffer.clear()
-                }
+                result.add(para to false)
+                currentBuffer.clear()
             }
         }
     }
