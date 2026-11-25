@@ -142,18 +142,25 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "2단계: 로컬 AI 엔진 로딩 중... (총 ${totalPages}쪽, ${totalParagraphsAll}개 단락)"
+                statusMessage = "2단계: S24 울트라 GPU AI 엔진 로딩 중... (총 ${totalPages}쪽, ${totalParagraphsAll}개 단락)"
             )
-            updateNotification("AI 모델 로딩 중...", "잠시만 기다려 주세요 (약 5~10초)", 0, totalParagraphsAll, true)
+            updateNotification("AI 모델 로딩 중...", "GPU 엔진에 모델을 올리고 있습니다 (약 5초)", 0, totalParagraphsAll, true)
 
-            // 네이티브 크래시 방지를 위해 CPU 백엔드 및 안전한 maxTokens(512) 설정
-            val options = LlmInference.LlmInferenceOptions.builder()
-                .setModelPath(modelPath)
-                .setMaxTokens(512)
-                .setPreferredBackend(LlmInference.Backend.CPU)
-                .build()
-
-            llmInference = LlmInference.createFromOptions(applicationContext, options)
+            // multi-prefill-seq GPU 전용 모델을 위해 Backend.GPU 설정 (자동 폴백 포함)
+            llmInference = try {
+                val gpuOptions = LlmInference.LlmInferenceOptions.builder()
+                    .setModelPath(modelPath)
+                    .setMaxTokens(512)
+                    .setPreferredBackend(LlmInference.Backend.GPU)
+                    .build()
+                LlmInference.createFromOptions(applicationContext, gpuOptions)
+            } catch (gpuEx: Throwable) {
+                val defaultOptions = LlmInference.LlmInferenceOptions.builder()
+                    .setModelPath(modelPath)
+                    .setMaxTokens(512)
+                    .build()
+                LlmInference.createFromOptions(applicationContext, defaultOptions)
+            }
 
             var processedParagraphsCount = 0
             val resultPages = mutableListOf<List<TranslatedParagraph>>()
@@ -187,7 +194,7 @@ class TranslationService : Service() {
                     )
 
                     val translatedText = translateParagraphWithLlm(
-                        llm = llmInference,
+                        llm = llmInference!!,
                         paragraph = rawPara,
                         sourceLang = sourceLang,
                         targetLang = targetLang
@@ -247,7 +254,6 @@ class TranslationService : Service() {
         sourceLang: String,
         targetLang: String
     ): String {
-        // ekv1280 토큰 한도 초과 방지를 위해 180자(1~2문장) 단위로 안전하게 분할
         val chunks = splitIntoSafeChunks(paragraph, maxChars = 180)
         val resultBuilder = StringBuilder()
 
@@ -283,7 +289,6 @@ class TranslationService : Service() {
                     chunks.add(buffer.toString().trim())
                     buffer.clear()
                 }
-                // 한 문장이 180자보다 길면 180자 단위로 강제 분할
                 var idx = 0
                 while (idx < sentence.length) {
                     val end = (idx + maxChars).coerceAtMost(sentence.length)
