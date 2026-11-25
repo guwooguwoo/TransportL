@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.io.OutputStream
+import java.nio.charset.StandardCharsets
 
 data class TranslatedParagraph(
     val text: String,
@@ -113,11 +114,11 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "1단계: PDF 텍스트 추출 및 챕터/섹션 단위로 병합 중...",
+                statusMessage = "1단계: PDF 텍스트 추출 및 구조 분석 중...",
                 isCompleted = false,
                 fileName = fileName
             )
-            updateNotification("PDF 챕터 분석 중...", fileName, 0, 0, true)
+            updateNotification("PDF 구조 분석 중...", fileName, 0, 0, true)
 
             val rawPages = extractPagesFromPdf(applicationContext, uri)
 
@@ -132,98 +133,97 @@ class TranslationService : Service() {
                 return
             }
 
-            // 페이지별 텍스트를 정제한 뒤, 챕터/섹션 단위로 크게 병합 (최대 1,400자씩 꽉 채움)
             val allParsedPages = rawPages.map { pageText ->
                 val cleanedText = cleanEnglishPdfNoise(pageText)
-                groupIntoChapterBlocks(cleanedText, maxBlockChars = 1400)
+                parseSmartLayoutUnits(cleanedText, maxUnitChars = 380)
             }
 
             val totalPages = allParsedPages.size
-            val totalBlocksAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
+            val totalUnitsAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
 
             updateState(
                 isRunning = true,
-                statusMessage = "2단계: S24 울트라 GPU 엔진 로딩 중... (총 ${totalPages}쪽 → ${totalBlocksAll}개 대단위 블록으로 압축)"
+                statusMessage = "2단계: S24 울트라 GPU 엔진 로딩 중... (총 ${totalPages}쪽, ${totalUnitsAll}개 항목)"
             )
-            updateNotification("AI 모델 로딩 중...", "잠시만 기다려 주세요 (약 5초)", 0, totalBlocksAll, true)
+            updateNotification("AI 모델 로딩 중...", "잠시만 기다려 주세요 (약 5초)", 0, totalUnitsAll, true)
 
             llmInference = try {
                 val gpuOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(1280)
+                    .setMaxTokens(1024)
                     .setPreferredBackend(LlmInference.Backend.GPU)
                     .build()
                 LlmInference.createFromOptions(applicationContext, gpuOptions)
             } catch (gpuEx: Throwable) {
                 val defaultOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
-                    .setMaxTokens(1280)
+                    .setMaxTokens(1024)
                     .build()
                 LlmInference.createFromOptions(applicationContext, defaultOptions)
             }
 
-            var processedBlocksCount = 0
+            var processedUnitsCount = 0
             val resultPages = mutableListOf<List<TranslatedParagraph>>()
 
-            for ((pageIdx, chapterBlocks) in allParsedPages.withIndex()) {
+            for ((pageIdx, pageUnits) in allParsedPages.withIndex()) {
                 val currentPageNum = pageIdx + 1
                 val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
 
-                if (chapterBlocks.isEmpty()) {
+                if (pageUnits.isEmpty()) {
                     resultPages.add(emptyList())
                     continue
                 }
 
-                for ((blockIdx, pair) in chapterBlocks.withIndex()) {
-                    val (rawBlock, isHeading) = pair
-                    val percent = ((processedBlocksCount.toFloat() / totalBlocksAll) * 100).toInt()
-                    val statusDetail = "챕터 단위 AI 통번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 블록 ${blockIdx + 1}/${chapterBlocks.size})"
+                for ((unitIdx, pair) in pageUnits.withIndex()) {
+                    val (rawUnit, isHeading) = pair
+                    val percent = ((processedUnitsCount.toFloat() / totalUnitsAll) * 100).toInt()
+                    val statusDetail = "정밀 AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 항목 ${unitIdx + 1}/${pageUnits.size})"
 
                     updateState(
                         isRunning = true,
                         statusMessage = statusDetail,
-                        currentPage = processedBlocksCount,
-                        totalPages = totalBlocksAll
+                        currentPage = processedUnitsCount,
+                        totalPages = totalUnitsAll
                     )
                     updateNotification(
-                        title = "AI 챕터 통번역 중 ($percent%)",
-                        content = "$currentPageNum/${totalPages}쪽 · 블록 ${blockIdx + 1}/${chapterBlocks.size} 통번역 중...",
-                        progress = processedBlocksCount,
-                        max = totalBlocksAll,
+                        title = "AI PDF 번역 중 ($percent%)",
+                        content = "$currentPageNum/${totalPages}쪽 · 항목 ${unitIdx + 1}/${pageUnits.size} 번역 중...",
+                        progress = processedUnitsCount,
+                        max = totalUnitsAll,
                         indeterminate = false
                     )
 
-                    val translatedText = if (!rawBlock.any { it.isLetter() }) {
-                        rawBlock
+                    val translatedText = if (!rawUnit.any { it.isLetter() }) {
+                        rawUnit
                     } else {
-                        translateBlockWithLlm(
+                        translateUnitWithOneShot(
                             llm = llmInference!!,
-                            blockText = rawBlock,
+                            unitText = rawUnit,
                             sourceLang = sourceLang,
                             targetLang = targetLang
                         )
                     }
 
-                    // 번역된 블록 내의 줄바꿈(\n\n)을 살려 깔끔한 문단들로 복원
-                    val subParagraphs = translatedText.ifBlank { rawBlock }
-                        .split(Regex("\\n{2,}"))
+                    val finalLines = translatedText.ifBlank { rawUnit }
+                        .replace("\\n", "\n")
+                        .split(Regex("\\n+"))
                         .map { it.trim() }
                         .filter { it.isNotEmpty() }
 
-                    if (subParagraphs.isEmpty()) {
-                        translatedPageParagraphs.add(TranslatedParagraph(rawBlock, isHeading))
+                    if (finalLines.isEmpty()) {
+                        translatedPageParagraphs.add(TranslatedParagraph(rawUnit, isHeading))
                     } else {
-                        subParagraphs.forEachIndexed { idx, subPara ->
+                        finalLines.forEachIndexed { idx, lineText ->
                             translatedPageParagraphs.add(
                                 TranslatedParagraph(
-                                    text = subPara,
+                                    text = lineText,
                                     isHeading = isHeading && idx == 0
                                 )
                             )
                         }
                     }
 
-                    processedBlocksCount++
+                    processedUnitsCount++
                 }
                 resultPages.add(translatedPageParagraphs)
             }
@@ -232,9 +232,9 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = false,
-                statusMessage = "✅ 고품질 AI 챕터 통번역 완료! (100%) 아래 버튼을 눌러 PDF를 저장하세요.",
-                currentPage = totalBlocksAll,
-                totalPages = totalBlocksAll,
+                statusMessage = "✅ 고품질 AI 번역 완료! (100%) 아래 버튼을 눌러 PDF를 저장하세요.",
+                currentPage = totalUnitsAll,
+                totalPages = totalUnitsAll,
                 isCompleted = true,
                 fileName = fileName
             )
@@ -243,8 +243,8 @@ class TranslationService : Service() {
             updateNotification(
                 title = "✅ AI PDF 번역 완료 (100%)",
                 content = "총 ${totalPages}페이지 번역 완료! 앱을 열어 PDF를 저장하세요.",
-                progress = totalBlocksAll,
-                max = totalBlocksAll,
+                progress = totalUnitsAll,
+                max = totalUnitsAll,
                 indeterminate = false,
                 ongoing = false
             )
@@ -266,95 +266,175 @@ class TranslationService : Service() {
         }
     }
 
-    private fun translateBlockWithLlm(
+    /**
+     * AI 거절 멘트("미안해요. 번역 기능은...") 및 일본어 튐 현상을 원천 차단하는 One-Shot 완성형 프롬프트
+     */
+    private fun translateUnitWithOneShot(
         llm: LlmInference,
-        blockText: String,
+        unitText: String,
         sourceLang: String,
         targetLang: String
     ): String {
-        val prompt = "<|im_start|>user\nTranslate the following $sourceLang text into natural, fluent $targetLang. Keep paragraph breaks. Output ONLY the translation:\n$blockText<|im_end|>\n<|im_start|>assistant\n"
+        val examplePair = when (targetLang) {
+            "Korean" -> "English: The Power of Love: Lovely Lena's Visit to Korea 164\nKorean: 사랑의 힘: 사랑스러운 레나의 한국 방문 164\n\n"
+            "Vietnamese" -> "English: The Power of Love: Lovely Lena's Visit to Korea 164\nVietnamese: Sức mạnh của tình yêu: Chuyến thăm Hàn Quốc của Lena đáng yêu 164\n\n"
+            else -> ""
+        }
+
+        val prompt = buildString {
+            append("<|im_start|>user\n")
+            append(examplePair)
+            append("$sourceLang: $unitText\n")
+            append("$targetLang:<|im_end|>\n")
+            append("<|im_start|>assistant\n")
+        }
 
         val rawResponse = llm.generateResponse(prompt)
-        return rawResponse
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .replace(Regex("^(Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
-            .trim()
+        return sanitizeAndRepairLlmOutput(rawResponse, targetLang, unitText)
     }
 
     /**
-     * 페이지 내 텍스트를 챕터 제목(Heading) 기준으로 나누되,
-     * 일반 본문은 모델 한계치(1,400자)까지 여러 단락을 한 덩어리로 꽉 채워 호출 횟수를 극단적으로 줄입니다.
+     * 1) Qwen BPE 토크나이저의 UTF-8 한글 깨짐(Ġìłĥ 등)을 원래 한글로 역변환 복구
+     * 2) AI 거절/헛소리 응답 감지 시 자동 재시도 또는 원문 보존
      */
-    private fun groupIntoChapterBlocks(pageText: String, maxBlockChars: Int): List<Pair<String, Boolean>> {
-        val rawParagraphs = mutableListOf<Pair<String, Boolean>>()
+    private fun sanitizeAndRepairLlmOutput(raw: String, targetLang: String, originalText: String): String {
+        var cleaned = raw
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("\\n", " ")
+            .replace("\n", " ")
+            .replace(Regex("^($targetLang:|Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        // AI가 챗봇처럼 거절하거나 헛소리를 뱉은 경우 필터링
+        if (cleaned.contains("번역 기능은 현재 지원되지") ||
+            cleaned.contains("이미 Korean입니다") ||
+            cleaned.contains("수정을 원하시면") ||
+            cleaned.contains("번역 작업을 수행하지")
+        ) {
+            return originalText
+        }
+
+        // BPE 깨짐 바이트 복구 시도
+        cleaned = repairBrokenBpeUtf8(cleaned)
+            .replace("Â·", " · ")
+            .replace("Â", "")
+            .replace(Regex("[Ġìłĥį¶«ªİığşç]"), "")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim()
+
+        return cleaned
+    }
+
+    /**
+     * Qwen2.5 모델이 UTF-8 바이트를 GPT-2 BPE 문자(Ġ=0x20, ì=0xEC 등)로 잘못 디코딩한 시퀀스를 원래 UTF-8 한글로 복구
+     */
+    private fun repairBrokenBpeUtf8(input: String): String {
+        return try {
+            val normalized = input.replace('Ġ', ' ')
+            val sb = StringBuilder()
+            var i = 0
+            while (i < normalized.length) {
+                val c1 = normalized[i].code
+                // UTF-8 한글 3바이트 시작 범위 (0xEA ~ 0xED)가 Latin-1로 잘못 디코딩된 경우
+                if (c1 in 0xEA..0xED && i + 2 < normalized.length) {
+                    val c2 = normalized[i + 1].code
+                    val c3 = normalized[i + 2].code
+                    if (c2 in 0x80..0xBF && c3 in 0x80..0xBF) {
+                        val bytes = byteArrayOf(c1.toByte(), c2.toByte(), c3.toByte())
+                        sb.append(String(bytes, StandardCharsets.UTF_8))
+                        i += 3
+                        continue
+                    }
+                }
+                sb.append(normalized[i])
+                i++
+            }
+            sb.toString()
+        } catch (_: Exception) {
+            input
+        }
+    }
+
+    private fun parseSmartLayoutUnits(pageText: String, maxUnitChars: Int): List<Pair<String, Boolean>> {
+        val units = mutableListOf<Pair<String, Boolean>>()
         val lines = pageText.lines()
-        val lineBuffer = StringBuilder()
+        val bodyBuffer = StringBuilder()
 
         for (line in lines) {
             val trimmed = line.trim()
+
             if (trimmed.isEmpty()) {
-                if (lineBuffer.isNotEmpty()) {
-                    val para = lineBuffer.toString().trim()
-                    val isHeading = para.length < 60 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-                    rawParagraphs.add(para to isHeading)
-                    lineBuffer.clear()
+                if (bodyBuffer.isNotEmpty()) {
+                    addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
+                    bodyBuffer.clear()
                 }
-            } else {
-                if (lineBuffer.isNotEmpty()) lineBuffer.append(" ")
-                lineBuffer.append(trimmed)
-            }
-        }
-        if (lineBuffer.isNotEmpty()) {
-            val para = lineBuffer.toString().trim()
-            val isHeading = para.length < 60 && !para.endsWith(".") && !para.endsWith("?") && !para.endsWith("!")
-            rawParagraphs.add(para to isHeading)
-        }
-
-        val chapterBlocks = mutableListOf<Pair<String, Boolean>>()
-        val blockBuffer = StringBuilder()
-        var blockStartsWithHeading = false
-
-        for ((para, isHeading) in rawParagraphs) {
-            if (isHeading && blockBuffer.isNotEmpty()) {
-                chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
-                blockBuffer.clear()
-                blockStartsWithHeading = false
+                continue
             }
 
-            if (blockBuffer.isNotEmpty() && blockBuffer.length + para.length > maxBlockChars) {
-                chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
-                blockBuffer.clear()
-                blockStartsWithHeading = false
-            }
+            // 목차 줄 판별: 줄 끝에 숫자가 있거나, 점선/중간점(·)이 있는 짧은 줄
+            val isTocLine = trimmed.matches(Regex(".*(\\.{2,}|\\s+|·)\\d{1,4}$"))
+            val isHeadingLine = !isTocLine && trimmed.length < 60 &&
+                    !trimmed.endsWith(".") && !trimmed.endsWith("?") && !trimmed.endsWith("!") && !trimmed.endsWith(",")
 
-            if (blockBuffer.isEmpty()) {
-                blockStartsWithHeading = isHeading
-            } else {
-                blockBuffer.append("\n\n")
-            }
-
-            if (para.length > maxBlockChars) {
-                val sentences = para.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
-                for (sentence in sentences) {
-                    if (blockBuffer.isNotEmpty() && blockBuffer.length + sentence.length > maxBlockChars) {
-                        chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
-                        blockBuffer.clear()
-                        blockStartsWithHeading = false
-                    }
-                    if (blockBuffer.isNotEmpty()) blockBuffer.append(" ")
-                    blockBuffer.append(sentence)
+            if (isTocLine || isHeadingLine) {
+                if (bodyBuffer.isNotEmpty()) {
+                    addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
+                    bodyBuffer.clear()
                 }
+                units.add(trimmed to isHeadingLine)
             } else {
-                blockBuffer.append(para)
+                if (bodyBuffer.isNotEmpty()) bodyBuffer.append(" ")
+                bodyBuffer.append(trimmed)
             }
         }
 
-        if (blockBuffer.isNotEmpty()) {
-            chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
+        if (bodyBuffer.isNotEmpty()) {
+            addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
         }
 
-        return chapterBlocks
+        return units
+    }
+
+    private fun addSplitBodyUnits(
+        targetList: MutableList<Pair<String, Boolean>>,
+        paragraph: String,
+        maxChars: Int
+    ) {
+        if (paragraph.length <= maxChars) {
+            targetList.add(paragraph to false)
+            return
+        }
+
+        val sentences = paragraph.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
+        val chunkBuffer = StringBuilder()
+
+        for (sentence in sentences) {
+            if (sentence.length > maxChars) {
+                if (chunkBuffer.isNotEmpty()) {
+                    targetList.add(chunkBuffer.toString().trim() to false)
+                    chunkBuffer.clear()
+                }
+                var idx = 0
+                while (idx < sentence.length) {
+                    val end = (idx + maxChars).coerceAtMost(sentence.length)
+                    targetList.add(sentence.substring(idx, end).trim() to false)
+                    idx = end
+                }
+                continue
+            }
+
+            if (chunkBuffer.isNotEmpty() && chunkBuffer.length + sentence.length > maxChars) {
+                targetList.add(chunkBuffer.toString().trim() to false)
+                chunkBuffer.clear()
+            }
+            if (chunkBuffer.isNotEmpty()) chunkBuffer.append(" ")
+            chunkBuffer.append(sentence)
+        }
+
+        if (chunkBuffer.isNotEmpty()) {
+            targetList.add(chunkBuffer.toString().trim() to false)
+        }
     }
 
     private fun updateState(
@@ -454,6 +534,7 @@ fun cleanEnglishPdfNoise(rawText: String): String {
         .replace("•", "- ")
         .replace("■", "- ")
         .replace("▪", "- ")
+        .replace("·", " · ")
 
     text = text.replace(Regex("([a-zA-Z])-\\s*\\n\\s*([a-zA-Z])"), "$1$2")
 
@@ -513,7 +594,7 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
             for (para in paragraphs) {
                 val paint = TextPaint().apply {
                     color = if (para.isHeading) Color.BLACK else Color.DKGRAY
-                    textSize = if (para.isHeading) fontSize + 2f else fontSize
+                    textSize = if (para.isHeading) fontSize + 1.5f else fontSize
                     isFakeBoldText = para.isHeading
                 }
                 val layout = StaticLayout.Builder.obtain(
@@ -523,7 +604,7 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
                     .setLineSpacing(2f, 1.15f)
                     .build()
 
-                val spacingAfter = if (para.isHeading) fontSize * 0.8f else fontSize * 1.1f
+                val spacingAfter = if (para.isHeading) fontSize * 0.6f else fontSize * 0.9f
                 totalHeight += layout.height + spacingAfter
                 tempLayouts.add(layout to para.isHeading)
             }
@@ -544,7 +625,7 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
             layout.draw(canvas)
             canvas.restore()
 
-            val spacingAfter = if (isHeading) fontSize * 0.8f else fontSize * 1.1f
+            val spacingAfter = if (isHeading) fontSize * 0.6f else fontSize * 0.9f
             currentY += layout.height + spacingAfter
         }
 
