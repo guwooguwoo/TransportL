@@ -1,4 +1,3 @@
-```kotlin
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -58,4 +57,3 @@ dependencies {
     // 오프라인 PDF 텍스트 추출 (PdfBox Android)
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 }
-```
