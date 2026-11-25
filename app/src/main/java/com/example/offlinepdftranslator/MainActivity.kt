@@ -61,13 +61,13 @@ fun OfflinePdfTranslatorScreen() {
         listOf(
             "한국어" to "Korean",
             "영어" to "English",
+            "러시아어" to "Russian",
+            "베트남어" to "Vietnamese",
             "일본어" to "Japanese",
             "중국어" to "Chinese",
             "스페인어" to "Spanish",
             "프랑스어" to "French",
             "독일어" to "German",
-            "러시아어" to "Russian",
-            "베트남어" to "Vietnamese",
             "태국어" to "Thai"
         )
     }
@@ -87,8 +87,8 @@ fun OfflinePdfTranslatorScreen() {
     var selectedPdfUri by remember { mutableStateOf<Uri?>(null) }
     var selectedFileName by remember { mutableStateOf("선택된 파일 없음") }
     var sourceLang by remember { mutableStateOf(languages[1]) } // 기본값: 영어
-    var targetLang by remember { mutableStateOf(languages[0]) } // 기본값: 한국어
-    var localStatus by remember { mutableStateOf("AI 모델 등록 후 PDF 파일을 가져와 주세요.") }
+    var targetLang by remember { mutableStateOf(languages[2]) } // 기본값: 러시아어 (언제든 변경 가능)
+    var localStatus by remember { mutableStateOf("번역 완료 시 [내장 메모리/Download] 폴더에 워드(.docx)로 자동 저장됩니다.") }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -140,42 +140,7 @@ fun OfflinePdfTranslatorScreen() {
             selectedPdfUri = uri
             selectedFileName = getFileNameFromUri(context, uri)
             TranslationService.resetCompletion()
-            localStatus = "파일 준비 완료. 백그라운드 번역을 시작할 수 있습니다."
-        }
-    }
-
-    // [런처 2] 번역 완료된 PDF 저장 런처
-    val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/pdf")
-    ) { saveUri: Uri? ->
-        val pagesToSave = TranslationService.completedPages
-        if (saveUri != null && pagesToSave.isNotEmpty()) {
-            coroutineScope.launch(Dispatchers.IO) {
-                try {
-                    context.contentResolver.openOutputStream(saveUri)?.use { outputStream ->
-                        createStructuredPdf(
-                            pages = pagesToSave,
-                            outputStream = outputStream
-                        )
-                    }
-                    withContext(Dispatchers.Main) {
-                        localStatus = "✅ 고품질 AI PDF 번역본 저장 완료!"
-                        TranslationService.resetCompletion()
-                        Toast.makeText(context, "PDF 파일이 성공적으로 저장되었습니다.", Toast.LENGTH_LONG).show()
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        localStatus = "❌ 저장 실패: ${e.message}"
-                    }
-                }
-            }
-        }
-    }
-
-    LaunchedEffect(progressState.isCompleted) {
-        if (progressState.isCompleted && TranslationService.completedPages.isNotEmpty()) {
-            val baseName = progressState.fileName.ifEmpty { selectedFileName }.removeSuffix(".pdf")
-            exportLauncher.launch("${baseName}_AI번역본.pdf")
+            localStatus = "파일 준비 완료! 아래 버튼을 누르면 번역 후 Download 폴더에 워드(.docx)로 자동 저장됩니다."
         }
     }
 
@@ -194,7 +159,7 @@ fun OfflinePdfTranslatorScreen() {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = "S24 울트라 AI PDF 번역기",
+            text = "S24 울트라 AI 문서 번역기",
             fontSize = 22.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(bottom = 24.dp)
@@ -261,15 +226,9 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // [버튼 2] 백그라운드 AI 번역 및 PDF 내보내기
+        // [버튼 2] 백그라운드 AI 번역 시작 (완료 즉시 Download 폴더에 워드 자동 저장)
         Button(
             onClick = {
-                if (progressState.isCompleted && TranslationService.completedPages.isNotEmpty()) {
-                    val baseName = progressState.fileName.ifEmpty { selectedFileName }.removeSuffix(".pdf")
-                    exportLauncher.launch("${baseName}_AI번역본.pdf")
-                    return@Button
-                }
-
                 val modelPath = savedModelPath
                 if (modelPath == null) {
                     Toast.makeText(context, "먼저 상단에서 AI 모델(.task/.bin)을 등록해 주세요.", Toast.LENGTH_LONG).show()
@@ -287,6 +246,8 @@ fun OfflinePdfTranslatorScreen() {
                     return@Button
                 }
 
+                TranslationService.resetCompletion()
+
                 val serviceIntent = Intent(context, TranslationService::class.java).apply {
                     putExtra(TranslationService.EXTRA_PDF_URI, uri.toString())
                     putExtra(TranslationService.EXTRA_FILE_NAME, selectedFileName)
@@ -295,15 +256,15 @@ fun OfflinePdfTranslatorScreen() {
                     putExtra(TranslationService.EXTRA_TARGET_LANG, targetLang.second)
                 }
                 ContextCompat.startForegroundService(context, serviceIntent)
-                Toast.makeText(context, "백그라운드에서 AI 번역을 시작합니다. 상단 알림바를 확인하세요.", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "번역을 시작합니다. 완료되면 Download 폴더에 워드(.docx)로 자동 저장됩니다!", Toast.LENGTH_LONG).show()
             },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(54.dp),
-            enabled = !isProcessing && ((savedModelPath != null && selectedPdfUri != null) || progressState.isCompleted)
+            enabled = !isProcessing && savedModelPath != null && selectedPdfUri != null
         ) {
             Text(
-                text = if (progressState.isCompleted) "2. 번역본 PDF 저장하기" else "2. 백그라운드 AI 번역 시작",
+                text = "2. AI 번역 시작 (워드 자동 저장)",
                 fontSize = 16.sp
             )
         }
@@ -335,7 +296,7 @@ fun OfflinePdfTranslatorScreen() {
             text = displayStatus,
             fontSize = 13.sp,
             textAlign = TextAlign.Center,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = if (progressState.isCompleted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }
