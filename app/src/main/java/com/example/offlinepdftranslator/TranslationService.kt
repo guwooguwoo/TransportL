@@ -1,3 +1,4 @@
+```kotlin
 package com.example.offlinepdftranslator
 
 import android.app.Notification
@@ -17,17 +18,13 @@ import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import androidx.core.app.NotificationCompat
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
+import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.tasks.await
+import java.io.File
 import java.io.OutputStream
 
 data class TranslatedParagraph(
@@ -37,7 +34,7 @@ data class TranslatedParagraph(
 
 data class TranslationProgressState(
     val isRunning: Boolean = false,
-    val statusMessage: String = "PDF 파일을 가져온 뒤 언어를 선택해 주세요.",
+    val statusMessage: String = "AI 모델(.task/.bin)과 PDF 파일을 선택해 주세요.",
     val currentPage: Int = 0,
     val totalPages: Int = 0,
     val isCompleted: Boolean = false,
@@ -50,18 +47,18 @@ class TranslationService : Service() {
     private lateinit var notificationManager: NotificationManager
 
     companion object {
-        const val CHANNEL_ID = "pdf_translation_channel"
-        const val NOTIFICATION_ID = 1001
+        const val CHANNEL_ID = "pdf_llm_translation_channel"
+        const val NOTIFICATION_ID = 1002
 
         const val EXTRA_PDF_URI = "extra_pdf_uri"
         const val EXTRA_FILE_NAME = "extra_file_name"
+        const val EXTRA_MODEL_PATH = "extra_model_path"
         const val EXTRA_SOURCE_LANG = "extra_source_lang"
         const val EXTRA_TARGET_LANG = "extra_target_lang"
 
         private val _progressState = MutableStateFlow(TranslationProgressState())
         val progressState = _progressState.asStateFlow()
 
-        // 번역 완료된 데이터 보관 (UI에서 파일 저장 시 사용)
         var completedPages: List<List<TranslatedParagraph>> = emptyList()
 
         fun resetCompletion() {
@@ -78,49 +75,63 @@ class TranslationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val uriString = intent?.getStringExtra(EXTRA_PDF_URI) ?: return START_NOT_STICKY
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "document.pdf"
-        val sourceLang = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: TranslateLanguage.ENGLISH
-        val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: TranslateLanguage.KOREAN
+        val modelPath = intent.getStringExtra(EXTRA_MODEL_PATH) ?: return START_NOT_STICKY
+        val sourceLang = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: "영어"
+        val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "한국어"
 
         val pdfUri = Uri.parse(uriString)
 
         startForeground(
             NOTIFICATION_ID,
-            buildNotification("번역 준비 중...", "언어팩 및 문서를 확인하고 있습니다.", 0, 0, true)
+            buildNotification("온디바이스 AI 엔진 로딩 중...", "S24 울트라 NPU/GPU에 모델을 올리고 있습니다.", 0, 0, true)
         )
 
         serviceScope.launch {
-            runTranslationTask(pdfUri, fileName, sourceLang, targetLang)
+            runLlmTranslationTask(pdfUri, fileName, modelPath, sourceLang, targetLang)
         }
 
         return START_NOT_STICKY
     }
 
-    private suspend fun runTranslationTask(
+    private suspend fun runLlmTranslationTask(
         uri: Uri,
         fileName: String,
+        modelPath: String,
         sourceLang: String,
         targetLang: String
     ) {
+        var llmInference: LlmInference? = null
         try {
+            val modelFile = File(modelPath)
+            if (!modelFile.exists()) {
+                updateState(
+                    isRunning = false,
+                    statusMessage = "❌ AI 모델 파일을 찾을 수 없습니다. 다시 선택해 주세요."
+                )
+                stopSelf()
+                return
+            }
+
             updateState(
                 isRunning = true,
-                statusMessage = "오프라인 언어팩 확인 중...\n(최초 1회만 다운로드되며 이후 백그라운드 오프라인 작동)",
+                statusMessage = "로컬 LLM 모델 메모리에 로딩 중...\n(최초 로딩에 약 5~10초 소요됩니다)",
                 isCompleted = false,
                 fileName = fileName
             )
 
-            val options = TranslatorOptions.Builder()
-                .setSourceLanguage(sourceLang)
-                .setTargetLanguage(targetLang)
+            // MediaPipe LLM Inference 엔진 초기화
+            val options = LlmInference.LlmInferenceOptions.builder()
+                .setModelPath(modelPath)
+                .setMaxTokens(1024)
+                .setTemperature(0.2f) // 번역의 정확성과 일관성을 위해 낮은 온도 설정
+                .setTopK(40)
                 .build()
-            val translator = Translation.getClient(options)
 
-            val conditions = DownloadConditions.Builder().build()
-            translator.downloadModelIfNeeded(conditions).await()
+            llmInference = LlmInference.createFromOptions(applicationContext, options)
 
             updateState(
                 isRunning = true,
-                statusMessage = "PDF 텍스트 정제 및 문장 분석 중..."
+                statusMessage = "PDF 텍스트 정제 및 단락 분석 중..."
             )
             updateNotification("PDF 분석 중...", fileName, 0, 0, true)
 
@@ -131,7 +142,8 @@ class TranslationService : Service() {
                     isRunning = false,
                     statusMessage = "❌ 텍스트를 추출할 수 없습니다. (스캔된 이미지 PDF일 수 있습니다)"
                 )
-                updateNotification("번역 실패", "텍스트를 추출할 수 없는 PDF입니다.", 0, 0, false)
+                stopForeground(STOP_FOREGROUND_DETACH)
+                updateNotification("번역 실패", "텍스트를 추출할 수 없는 PDF입니다.", 0, 0, false, ongoing = false)
                 stopSelf()
                 return
             }
@@ -141,7 +153,7 @@ class TranslationService : Service() {
 
             for ((pageIdx, pageText) in rawPages.withIndex()) {
                 val currentPageNum = pageIdx + 1
-                val msg = "백그라운드 번역 중... ($currentPageNum / $totalPages 페이지)"
+                val msg = "AI 문맥 번역 중... ($currentPageNum / $totalPages 페이지)"
                 updateState(
                     isRunning = true,
                     statusMessage = msg,
@@ -149,7 +161,7 @@ class TranslationService : Service() {
                     totalPages = totalPages
                 )
                 updateNotification(
-                    title = "PDF 번역 진행 중 ($currentPageNum/$totalPages 페이지)",
+                    title = "AI PDF 번역 진행 중 ($currentPageNum/$totalPages 페이지)",
                     content = fileName,
                     progress = currentPageNum,
                     max = totalPages,
@@ -161,10 +173,11 @@ class TranslationService : Service() {
                 val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
 
                 for ((rawPara, isHeading) in parsedParagraphs) {
-                    val translatedText = translateByCompleteSentences(
-                        translator = translator,
+                    val translatedText = translateParagraphWithLlm(
+                        llm = llmInference,
                         paragraph = rawPara,
-                        isTargetKorean = (targetLang == TranslateLanguage.KOREAN)
+                        sourceLang = sourceLang,
+                        targetLang = targetLang
                     )
                     translatedPageParagraphs.add(
                         TranslatedParagraph(
@@ -176,22 +189,20 @@ class TranslationService : Service() {
                 resultPages.add(translatedPageParagraphs)
             }
 
-            translator.close()
             completedPages = resultPages
 
             updateState(
                 isRunning = false,
-                statusMessage = "✅ 번역 완료! 아래 버튼을 눌러 PDF를 저장하세요.",
+                statusMessage = "✅ 고품질 AI 번역 완료! 아래 버튼을 눌러 PDF를 저장하세요.",
                 currentPage = totalPages,
                 totalPages = totalPages,
                 isCompleted = true,
                 fileName = fileName
             )
 
-            // 완료 알림 띄우기 (포그라운드 종료 후에도 알림바에 완료 표시 유지)
             stopForeground(STOP_FOREGROUND_DETACH)
             updateNotification(
-                title = "✅ PDF 번역 완료 ($totalPages 페이지)",
+                title = "✅ AI PDF 번역 완료 ($totalPages 페이지)",
                 content = "앱을 열어 번역본 PDF를 저장하세요.",
                 progress = totalPages,
                 max = totalPages,
@@ -203,12 +214,75 @@ class TranslationService : Service() {
         } catch (e: Exception) {
             updateState(
                 isRunning = false,
-                statusMessage = "❌ 오류 발생: ${e.localizedMessage}\n(최초 실행 시 언어팩 다운로드를 위해 인터넷 연결이 필요합니다)"
+                statusMessage = "❌ AI 실행 오류: ${e.localizedMessage}\n(MediaPipe 호환 .task 또는 .bin 모델인지 확인해 주세요)"
             )
             stopForeground(STOP_FOREGROUND_DETACH)
             updateNotification("번역 중 오류 발생", e.localizedMessage ?: "알 수 없는 오류", 0, 0, false, ongoing = false)
             stopSelf()
+        } finally {
+            try {
+                llmInference?.close()
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    /**
+     * 로컬 LLM에 전문 번역가 프롬프트를 전달하여 문맥과 어순이 자연스러운 번역 생성
+     */
+    private fun translateParagraphWithLlm(
+        llm: LlmInference,
+        paragraph: String,
+        sourceLang: String,
+        targetLang: String
+    ): String {
+        // 긴 문단은 토큰 한도(1024)를 넘지 않도록 500자 내외 문장 단위로 안전하게 분할
+        val chunks = splitIntoSafeChunks(paragraph, maxChars = 500)
+        val resultBuilder = StringBuilder()
+
+        for (chunk in chunks) {
+            val prompt = buildString {
+                append("You are a professional native translator.\n")
+                append("Translate the following $sourceLang text into natural, fluent $targetLang.\n")
+                append("Rules:\n")
+                append("1. Adapt the sentence structure and word order naturally for $targetLang readers.\n")
+                append("2. Output ONLY the translated text without any explanations, notes, or quotes.\n\n")
+                append("Text:\n")
+                append(chunk)
+                append("\n\nTranslation:")
+            }
+
+            val rawResponse = llm.generateResponse(prompt)
+            val cleanedResponse = rawResponse
+                .replace(Regex("^(Translation:|번역:|번역 결과:)\\s*", RegexOption.IGNORE_CASE), "")
+                .trim()
+
+            if (resultBuilder.isNotEmpty()) resultBuilder.append(" ")
+            resultBuilder.append(cleanedResponse)
+        }
+
+        return resultBuilder.toString().trim()
+    }
+
+    private fun splitIntoSafeChunks(text: String, maxChars: Int): List<String> {
+        if (text.length <= maxChars) return listOf(text)
+
+        val sentences = text.split(Regex("(?<=[.?!;][\"'”’)\\]]?)\\s+"))
+        val chunks = mutableListOf<String>()
+        val buffer = StringBuilder()
+
+        for (sentence in sentences) {
+            if (buffer.isNotEmpty() && buffer.length + sentence.length > maxChars) {
+                chunks.add(buffer.toString().trim())
+                buffer.clear()
+            }
+            if (buffer.isNotEmpty()) buffer.append(" ")
+            buffer.append(sentence)
+        }
+        if (buffer.isNotEmpty()) {
+            chunks.add(buffer.toString().trim())
+        }
+        return chunks
     }
 
     private fun updateState(
@@ -281,10 +355,10 @@ class TranslationService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "PDF 오프라인 번역 진행률",
+                "AI PDF 오프라인 번역 진행률",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "백그라운드에서 진행 중인 PDF 번역 상태를 표시합니다."
+                description = "백그라운드에서 진행 중인 온디바이스 AI PDF 번역 상태를 표시합니다."
             }
             notificationManager.createNotificationChannel(channel)
         }
@@ -299,7 +373,7 @@ class TranslationService : Service() {
 }
 
 // ============================================================================
-// PDF 추출, 영어 전처리, 한글 번역투 교정 후처리 및 PDF 생성 유틸리티
+// PDF 추출, 영어 노이즈 제거 및 페이지/단락 맞춤 PDF 생성 유틸리티
 // ============================================================================
 
 fun cleanEnglishPdfNoise(rawText: String): String {
@@ -313,93 +387,14 @@ fun cleanEnglishPdfNoise(rawText: String): String {
         .replace("■", "- ")
         .replace("▪", "- ")
 
-    // 줄 끝 하이픈으로 끊긴 영단어 복원
     text = text.replace(Regex("([a-zA-Z])-\\s*\\n\\s*([a-zA-Z])"), "$1$2")
 
-    // 단독 숫자(페이지 번호) 줄 제거
     val filteredLines = text.lines().filter { line ->
         val trimmed = line.trim()
         !trimmed.matches(Regex("^[-–—]?\\s*\\d+\\s*[-–—]?$"))
     }
 
     return filteredLines.joinToString("\n")
-}
-
-/**
- * 완전한 문장(. ? ! ;) 단위로 분리 번역 후, 한국어일 경우 번역투 교정 후처리 적용
- */
-suspend fun translateByCompleteSentences(
-    translator: Translator,
-    paragraph: String,
-    isTargetKorean: Boolean
-): String {
-    // 영어 약어 뒤의 마침표 보호
-    val protectedText = paragraph.replace(
-        Regex("\\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\\.g|i\\.e)\\.", RegexOption.IGNORE_CASE)
-    ) { matchResult ->
-        matchResult.value.replace(".", "###DOT###")
-    }
-
-    // . ? ! 및 긴 복문을 나누는 세미콜론(;) 기준으로 완전한 절/문장 분리
-    val rawSentences = protectedText.split(Regex("(?<=[.?!;][\"'”’)\\]]?)\\s+"))
-        .map { it.replace("###DOT###", ".").trim() }
-        .filter { it.isNotEmpty() }
-
-    if (rawSentences.isEmpty()) {
-        val raw = translator.translate(paragraph).await()
-        return if (isTargetKorean) polishKoreanTranslation(raw) else raw
-    }
-
-    val translatedSentences = mutableListOf<String>()
-    for (sentence in rawSentences) {
-        val translated = translator.translate(sentence).await().trim()
-        val polished = if (isTargetKorean) polishKoreanTranslation(translated) else translated
-        translatedSentences.add(polished)
-    }
-
-    return translatedSentences.joinToString(" ")
-}
-
-/**
- * [1번 개선안 핵심] 영한 기계번역 특유의 어색한 번역투·피동형·대명사를 자연스러운 한국어로 교정
- */
-fun polishKoreanTranslation(text: String): String {
-    var result = text
-
-    // 1. 어색한 이중 피동 및 영어식 수동태 표현 교정
-    result = result
-        .replace("되어진다", "된다")
-        .replace("되어집니다", "됩니다")
-        .replace("되어졌다", "되었다")
-        .replace("되어지는", "되는")
-        .replace("되어질", "될")
-        .replace("보여진다", "보인다")
-        .replace("보여집니다", "보입니다")
-        .replace("쓰여진다", "쓰인다")
-        .replace("불리어지는", "불리는")
-        .replace("만들어졌다", "만들어졌다")
-        .replace("에 의해 수행된다", "을 통해 이루어진다")
-        .replace("에 의해 야기된다", "때문에 발생한다")
-
-    // 2. 문장 맨 앞의 불필요한 지시대명사 직역(It is / They are / This is) 완화
-    result = result.replace(Regex("^(그것은|그들은|그것들은)\\s+"), "")
-
-    // 3. 어색한 연결어 및 직역투 순화
-    result = result
-        .replace("당신은 ", "") // 불특정 다수를 가리키는 'You' 직역 제거
-        .replace("당신의 ", "")
-        .replace("할 수 있는 능력을 가지고 있다", "할 수 있다")
-        .replace("하는 것이 가능하다", "할 수 있다")
-        .replace("에 대한 이해를 제공한다", "을 이해하도록 돕는다")
-        .replace("중요한 역할을 한다", "중요한 역할을 합니다".let { "중요한 역할을 한다" })
-
-    // 4. 문장 부호 및 띄어쓰기 정리
-    result = result
-        .replace(Regex("\\s+([.,?!])"), "$1") // 마침표/쉼표 앞 불필요한 공백 제거
-        .replace(Regex("([.,?!])([가-힣a-zA-Z0-9])"), "$1 $2") // 문장부호 뒤 띄어쓰기 보정
-        .replace(Regex("\\s{2,}"), " ") // 이중 공백 제거
-
-    return result.trim()
 }
 
 fun extractPagesFromPdf(context: Context, uri: Uri): List<String> {
@@ -440,7 +435,7 @@ fun splitIntoSmartParagraphs(pageText: String): List<Pair<String, Boolean>> {
 
             if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) {
                 val para = currentBuffer.toString().trim()
-                if (para.length > 100) {
+                if (para.length > 120) {
                     result.add(para to false)
                     currentBuffer.clear()
                 }
@@ -529,3 +524,4 @@ fun createStructuredPdf(pages: List<List<TranslatedParagraph>>, outputStream: Ou
     pdfDocument.writeTo(outputStream)
     pdfDocument.close()
 }
+```
