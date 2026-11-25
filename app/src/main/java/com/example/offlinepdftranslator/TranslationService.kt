@@ -75,8 +75,8 @@ class TranslationService : Service() {
         val uriString = intent?.getStringExtra(EXTRA_PDF_URI) ?: return START_NOT_STICKY
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "document.pdf"
         val modelPath = intent.getStringExtra(EXTRA_MODEL_PATH) ?: return START_NOT_STICKY
-        val sourceLang = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: "영어"
-        val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "한국어"
+        val sourceLang = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: "English"
+        val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "Korean"
 
         val pdfUri = Uri.parse(uriString)
 
@@ -224,16 +224,12 @@ class TranslationService : Service() {
         }
     }
 
-    /**
-     * 로컬 LLM에 전문 번역가 프롬프트를 전달하여 문맥과 어순이 자연스러운 번역 생성
-     */
     private fun translateParagraphWithLlm(
         llm: LlmInference,
         paragraph: String,
         sourceLang: String,
         targetLang: String
     ): String {
-        // 긴 문단은 토큰 한도(1024)를 넘지 않도록 500자 내외 문장 단위로 안전하게 분할
         val chunks = splitIntoSafeChunks(paragraph, maxChars = 500)
         val resultBuilder = StringBuilder()
 
@@ -368,10 +364,6 @@ class TranslationService : Service() {
         serviceScope.cancel()
     }
 }
-
-// ============================================================================
-// PDF 추출, 영어 노이즈 제거 및 페이지/단락 맞춤 PDF 생성 유틸리티
-// ============================================================================
 
 fun cleanEnglishPdfNoise(rawText: String): String {
     var text = rawText
