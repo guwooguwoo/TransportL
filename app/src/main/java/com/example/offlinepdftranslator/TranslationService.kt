@@ -151,8 +151,6 @@ class TranslationService : Service() {
                 val gpuOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
                     .setMaxTokens(1280)
-                    .setTopK(1)
-                    .setTemperature(0.0f)
                     .setPreferredBackend(LlmInference.Backend.GPU)
                     .build()
                 LlmInference.createFromOptions(applicationContext, gpuOptions)
@@ -160,8 +158,6 @@ class TranslationService : Service() {
                 val defaultOptions = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelPath)
                     .setMaxTokens(1280)
-                    .setTopK(1)
-                    .setTemperature(0.0f)
                     .build()
                 LlmInference.createFromOptions(applicationContext, defaultOptions)
             }
@@ -315,20 +311,17 @@ class TranslationService : Service() {
             rawParagraphs.add(para to isHeading)
         }
 
-        // 이제 추출된 단락들을 챕터/대단위 블록(최대 1,400자)으로 묶음
         val chapterBlocks = mutableListOf<Pair<String, Boolean>>()
         val blockBuffer = StringBuilder()
         var blockStartsWithHeading = false
 
         for ((para, isHeading) in rawParagraphs) {
-            // 새로운 챕터 제목이 등장하면 기존에 모인 본문을 먼저 확정
             if (isHeading && blockBuffer.isNotEmpty()) {
                 chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
                 blockBuffer.clear()
                 blockStartsWithHeading = false
             }
 
-            // 현재 단락을 더했을 때 maxBlockChars(1,400자)를 넘으면 기존 블록을 먼저 확정
             if (blockBuffer.isNotEmpty() && blockBuffer.length + para.length > maxBlockChars) {
                 chapterBlocks.add(blockBuffer.toString().trim() to blockStartsWithHeading)
                 blockBuffer.clear()
@@ -341,7 +334,6 @@ class TranslationService : Service() {
                 blockBuffer.append("\n\n")
             }
 
-            // 단락 하나 자체가 1,400자보다 긴 경우에만 문장 끝(.!?) 기준으로 분할
             if (para.length > maxBlockChars) {
                 val sentences = para.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
                 for (sentence in sentences) {
