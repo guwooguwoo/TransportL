@@ -118,17 +118,17 @@ class TranslationService : Service() {
                 fileName = fileName
             )
 
-            // MediaPipe LLM Inference 엔진 초기화
+            // MediaPipe LLM Inference 엔진 초기화 (응답 속도 최적화를 위해 maxTokens = 512 설정)
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(modelPath)
-                .setMaxTokens(1024)
+                .setMaxTokens(512)
                 .build()
 
             llmInference = LlmInference.createFromOptions(applicationContext, options)
 
             updateState(
                 isRunning = true,
-                statusMessage = "PDF 텍스트 정제 및 단락 분석 중..."
+                statusMessage = "PDF 텍스트 정제 및 전체 단락 분석 중..."
             )
             updateNotification("PDF 분석 중...", fileName, 0, 0, true)
 
@@ -145,37 +145,45 @@ class TranslationService : Service() {
                 return
             }
 
-            val totalPages = rawPages.size
+            // 전체 페이지의 단락을 미리 분리하여 정확한 전체 단락 수 계산
+            val allParsedPages = rawPages.map { pageText ->
+                val cleanedText = cleanEnglishPdfNoise(pageText)
+                splitIntoSmartParagraphs(cleanedText)
+            }
+
+            val totalPages = allParsedPages.size
+            val totalParagraphsAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
+            var processedParagraphsCount = 0
+
             val resultPages = mutableListOf<List<TranslatedParagraph>>()
 
-            for ((pageIdx, pageText) in rawPages.withIndex()) {
+            for ((pageIdx, parsedParagraphs) in allParsedPages.withIndex()) {
                 val currentPageNum = pageIdx + 1
-                val msg = "AI 문맥 번역 중... ($currentPageNum / $totalPages 페이지)"
-                updateState(
-                    isRunning = true,
-                    statusMessage = msg,
-                    currentPage = currentPageNum,
-                    totalPages = totalPages
-                )
-                updateNotification(
-                    title = "AI PDF 번역 진행 중 ($currentPageNum/$totalPages 페이지)",
-                    content = fileName,
-                    progress = currentPageNum,
-                    max = totalPages,
-                    indeterminate = false
-                )
-
-                val cleanedText = cleanEnglishPdfNoise(pageText)
-                val parsedParagraphs = splitIntoSmartParagraphs(cleanedText)
                 val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
+
+                if (parsedParagraphs.isEmpty()) {
+                    resultPages.add(emptyList())
+                    continue
+                }
 
                 for ((paraIdx, pair) in parsedParagraphs.withIndex()) {
                     val (rawPara, isHeading) = pair
+                    val percent = ((processedParagraphsCount.toFloat() / totalParagraphsAll) * 100).toInt()
+                    val statusDetail = "AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 - 단락 ${paraIdx + 1}/${parsedParagraphs.size})"
+
+                    // 앱 내부 화면과 상단 알림바 모두 단락 단위로 실시간 업데이트
                     updateState(
                         isRunning = true,
-                        statusMessage = "AI 번역 중... ($currentPageNum/$totalPages 페이지 - 단락 ${paraIdx + 1}/${parsedParagraphs.size})",
-                        currentPage = currentPageNum,
-                        totalPages = totalPages
+                        statusMessage = statusDetail,
+                        currentPage = processedParagraphsCount,
+                        totalPages = totalParagraphsAll
+                    )
+                    updateNotification(
+                        title = "AI 번역 진행 중 ($percent%)",
+                        content = "$currentPageNum/${totalPages}페이지 · 단락 ${paraIdx + 1}/${parsedParagraphs.size} 번역 중...",
+                        progress = processedParagraphsCount,
+                        max = totalParagraphsAll,
+                        indeterminate = false
                     )
 
                     val translatedText = translateParagraphWithLlm(
@@ -190,6 +198,7 @@ class TranslationService : Service() {
                             isHeading = isHeading
                         )
                     )
+                    processedParagraphsCount++
                 }
                 resultPages.add(translatedPageParagraphs)
             }
@@ -198,19 +207,19 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = false,
-                statusMessage = "✅ 고품질 AI 번역 완료! 아래 버튼을 눌러 PDF를 저장하세요.",
-                currentPage = totalPages,
-                totalPages = totalPages,
+                statusMessage = "✅ 고품질 AI 번역 완료! (100%) 아래 버튼을 눌러 PDF를 저장하세요.",
+                currentPage = totalParagraphsAll,
+                totalPages = totalParagraphsAll,
                 isCompleted = true,
                 fileName = fileName
             )
 
             stopForeground(STOP_FOREGROUND_DETACH)
             updateNotification(
-                title = "✅ AI PDF 번역 완료 ($totalPages 페이지)",
-                content = "앱을 열어 번역본 PDF를 저장하세요.",
-                progress = totalPages,
-                max = totalPages,
+                title = "✅ AI PDF 번역 완료 (100%)",
+                content = "총 ${totalPages}페이지 번역 완료! 앱을 열어 PDF를 저장하세요.",
+                progress = totalParagraphsAll,
+                max = totalParagraphsAll,
                 indeterminate = false,
                 ongoing = false
             )
@@ -238,11 +247,10 @@ class TranslationService : Service() {
         sourceLang: String,
         targetLang: String
     ): String {
-        val chunks = splitIntoSafeChunks(paragraph, maxChars = 400)
+        val chunks = splitIntoSafeChunks(paragraph, maxChars = 350)
         val resultBuilder = StringBuilder()
 
         for (chunk in chunks) {
-            // Qwen2.5 Instruct 전용 ChatML 템플릿 적용
             val prompt = buildString {
                 append("<|im_start|>system\n")
                 append("You are a professional native translator. Translate the given $sourceLang text into natural, fluent $targetLang. Output ONLY the translated text without any explanations, notes, or quotes.<|im_end|>\n")
