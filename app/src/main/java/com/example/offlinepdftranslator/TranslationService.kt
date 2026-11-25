@@ -82,7 +82,7 @@ class TranslationService : Service() {
 
         startForeground(
             NOTIFICATION_ID,
-            buildNotification("온디바이스 AI 엔진 로딩 중...", "S24 울트라 NPU/GPU에 모델을 올리고 있습니다.", 0, 0, true)
+            buildNotification("온디바이스 AI 엔진 준비 중...", "모델을 초기화하고 있습니다.", 0, 0, true)
         )
 
         serviceScope.launch {
@@ -113,22 +113,9 @@ class TranslationService : Service() {
 
             updateState(
                 isRunning = true,
-                statusMessage = "로컬 LLM 모델 메모리에 로딩 중...\n(최초 로딩에 약 5~10초 소요됩니다)",
+                statusMessage = "1단계: PDF 텍스트 추출 및 단락 분석 중...",
                 isCompleted = false,
                 fileName = fileName
-            )
-
-            // MediaPipe LLM Inference 엔진 초기화 (응답 속도 최적화를 위해 maxTokens = 512 설정)
-            val options = LlmInference.LlmInferenceOptions.builder()
-                .setModelPath(modelPath)
-                .setMaxTokens(512)
-                .build()
-
-            llmInference = LlmInference.createFromOptions(applicationContext, options)
-
-            updateState(
-                isRunning = true,
-                statusMessage = "PDF 텍스트 정제 및 전체 단락 분석 중..."
             )
             updateNotification("PDF 분석 중...", fileName, 0, 0, true)
 
@@ -145,7 +132,6 @@ class TranslationService : Service() {
                 return
             }
 
-            // 전체 페이지의 단락을 미리 분리하여 정확한 전체 단락 수 계산
             val allParsedPages = rawPages.map { pageText ->
                 val cleanedText = cleanEnglishPdfNoise(pageText)
                 splitIntoSmartParagraphs(cleanedText)
@@ -153,8 +139,23 @@ class TranslationService : Service() {
 
             val totalPages = allParsedPages.size
             val totalParagraphsAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
-            var processedParagraphsCount = 0
 
+            updateState(
+                isRunning = true,
+                statusMessage = "2단계: 로컬 AI 엔진 로딩 중... (총 ${totalPages}쪽, ${totalParagraphsAll}개 단락)"
+            )
+            updateNotification("AI 모델 로딩 중...", "잠시만 기다려 주세요 (약 5~10초)", 0, totalParagraphsAll, true)
+
+            // 네이티브 크래시 방지를 위해 CPU 백엔드 및 안전한 maxTokens(512) 설정
+            val options = LlmInference.LlmInferenceOptions.builder()
+                .setModelPath(modelPath)
+                .setMaxTokens(512)
+                .setPreferredBackend(LlmInference.Backend.CPU)
+                .build()
+
+            llmInference = LlmInference.createFromOptions(applicationContext, options)
+
+            var processedParagraphsCount = 0
             val resultPages = mutableListOf<List<TranslatedParagraph>>()
 
             for ((pageIdx, parsedParagraphs) in allParsedPages.withIndex()) {
@@ -169,9 +170,8 @@ class TranslationService : Service() {
                 for ((paraIdx, pair) in parsedParagraphs.withIndex()) {
                     val (rawPara, isHeading) = pair
                     val percent = ((processedParagraphsCount.toFloat() / totalParagraphsAll) * 100).toInt()
-                    val statusDetail = "AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 - 단락 ${paraIdx + 1}/${parsedParagraphs.size})"
+                    val statusDetail = "AI 번역 중: $percent% ($currentPageNum/${totalPages}쪽 · 단락 ${paraIdx + 1}/${parsedParagraphs.size})"
 
-                    // 앱 내부 화면과 상단 알림바 모두 단락 단위로 실시간 업데이트
                     updateState(
                         isRunning = true,
                         statusMessage = statusDetail,
@@ -180,7 +180,7 @@ class TranslationService : Service() {
                     )
                     updateNotification(
                         title = "AI 번역 진행 중 ($percent%)",
-                        content = "$currentPageNum/${totalPages}페이지 · 단락 ${paraIdx + 1}/${parsedParagraphs.size} 번역 중...",
+                        content = "$currentPageNum/${totalPages}쪽 · 단락 ${paraIdx + 1}/${parsedParagraphs.size} 처리 중",
                         progress = processedParagraphsCount,
                         max = totalParagraphsAll,
                         indeterminate = false
@@ -247,18 +247,14 @@ class TranslationService : Service() {
         sourceLang: String,
         targetLang: String
     ): String {
-        val chunks = splitIntoSafeChunks(paragraph, maxChars = 350)
+        // ekv1280 토큰 한도 초과 방지를 위해 180자(1~2문장) 단위로 안전하게 분할
+        val chunks = splitIntoSafeChunks(paragraph, maxChars = 180)
         val resultBuilder = StringBuilder()
 
         for (chunk in chunks) {
-            val prompt = buildString {
-                append("<|im_start|>system\n")
-                append("You are a professional native translator. Translate the given $sourceLang text into natural, fluent $targetLang. Output ONLY the translated text without any explanations, notes, or quotes.<|im_end|>\n")
-                append("<|im_start|>user\n")
-                append(chunk)
-                append("<|im_end|>\n")
-                append("<|im_start|>assistant\n")
-            }
+            if (chunk.isBlank()) continue
+
+            val prompt = "<|im_start|>user\nTranslate this $sourceLang text into natural $targetLang. Output ONLY the translation:\n$chunk<|im_end|>\n<|im_start|>assistant\n"
 
             val rawResponse = llm.generateResponse(prompt)
             val cleanedResponse = rawResponse
@@ -282,6 +278,21 @@ class TranslationService : Service() {
         val buffer = StringBuilder()
 
         for (sentence in sentences) {
+            if (sentence.length > maxChars) {
+                if (buffer.isNotEmpty()) {
+                    chunks.add(buffer.toString().trim())
+                    buffer.clear()
+                }
+                // 한 문장이 180자보다 길면 180자 단위로 강제 분할
+                var idx = 0
+                while (idx < sentence.length) {
+                    val end = (idx + maxChars).coerceAtMost(sentence.length)
+                    chunks.add(sentence.substring(idx, end).trim())
+                    idx = end
+                }
+                continue
+            }
+
             if (buffer.isNotEmpty() && buffer.length + sentence.length > maxChars) {
                 chunks.add(buffer.toString().trim())
                 buffer.clear()
