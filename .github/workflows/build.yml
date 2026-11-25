@@ -19,13 +19,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.7'
+      - name: Setup Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle-8.7-bin.zip
 
       - name: Build Debug APK
-        run: gradle assembleDebug
+        run: ./gradle-8.7/bin/gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
