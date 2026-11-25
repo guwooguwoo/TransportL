@@ -1,3 +1,4 @@
+```kotlin
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,8 +12,8 @@ android {
         applicationId = "com.example.offlinepdftranslator"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0-LLM"
         multiDexEnabled = true
     }
 
@@ -51,10 +52,10 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.multidex:multidex:2.0.1")
 
-    // 오프라인 다중 언어 번역 (Google ML Kit)
-    implementation("com.google.mlkit:translate:17.0.2")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
+    // 온디바이스 생성형 AI 엔진 (Google MediaPipe Tasks GenAI)
+    implementation("com.google.mediapipe:tasks-genai:0.10.22")
 
     // 오프라인 PDF 텍스트 추출 (PdfBox Android)
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 }
+```
