@@ -1,4 +1,3 @@
-```kotlin
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -61,4 +60,3 @@ dependencies {
     // 2단계 문맥·어순 윤문용 온디바이스 생성형 AI 엔진 (MediaPipe GenAI)
     implementation("com.google.mediapipe:tasks-genai:0.10.24")
 }
-```
