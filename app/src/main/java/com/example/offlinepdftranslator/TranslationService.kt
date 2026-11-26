@@ -149,7 +149,7 @@ class TranslationService : Service() {
                     statusMessage = "0단계: PDF 텍스트 인식 중... ($current / $total 페이지)"
                 )
                 updateNotification(
-                    title = "0단계: PDF 텍스트 추출 ($current/$total쪽)",
+                    title = "0단계: PDF 텍스트 추출 ($current/${total}쪽)",
                     content = fileName,
                     progress = current,
                     max = total,
