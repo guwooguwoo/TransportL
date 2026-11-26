@@ -57,6 +57,6 @@ dependencies {
     // 2단계 문맥·어순 윤문용 온디바이스 생성형 AI 엔진 (MediaPipe GenAI)
     implementation("com.google.mediapipe:tasks-genai:0.10.24")
 
-    // 오프라인 PDF 텍스트 추출 (PdfBox Android)
-    implementation("com.tom_roush:pdfbox-android:2.0.27.0")
+    // 오프라인 PDF 텍스트 추출 (PdfBox Android 안정 버전)
+    implementation("com.tom_roush:pdfbox-android:2.0.25.0")
 }
