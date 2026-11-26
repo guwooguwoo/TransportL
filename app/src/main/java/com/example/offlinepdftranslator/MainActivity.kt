@@ -24,11 +24,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,8 +46,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun OfflinePdfTranslatorScreen() {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-
     val progressState by TranslationService.progressState.collectAsState()
 
     val languages = remember {
@@ -70,23 +63,11 @@ fun OfflinePdfTranslatorScreen() {
         )
     }
 
-    var savedModelPath by remember {
-        val existingModel = File(context.filesDir, "llm_model.task")
-        mutableStateOf(if (existingModel.exists() && existingModel.length() > 10_000_000L) existingModel.absolutePath else null)
-    }
-    var modelStatusText by remember {
-        mutableStateOf(
-            if (savedModelPath != null) "✅ AI 모델 준비됨 (내장 저장소에 등록 완료)"
-            else "선택된 AI 모델 없음 (.task / .bin 파일 필요)"
-        )
-    }
-    var isCopyingModel by remember { mutableStateOf(false) }
-
     var selectedPdfUri by remember { mutableStateOf<Uri?>(null) }
     var selectedFileName by remember { mutableStateOf("선택된 파일 없음") }
     var sourceLang by remember { mutableStateOf(languages[1]) } // 기본값: 영어
-    var targetLang by remember { mutableStateOf(languages[2]) } // 기본값: 러시아어 (언제든 변경 가능)
-    var localStatus by remember { mutableStateOf("번역 완료 시 [내장 메모리/Download] 폴더에 워드(.docx)로 자동 저장됩니다.") }
+    var targetLang by remember { mutableStateOf(languages[2]) } // 기본값: 러시아어
+    var localStatus by remember { mutableStateOf("별도 AI 모델 파일 없이 초고속으로 번역되어 [Download] 폴더에 워드(.docx)로 자동 저장됩니다.") }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -106,31 +87,7 @@ fun OfflinePdfTranslatorScreen() {
         }
     }
 
-    // [런처 0] 온디바이스 AI 모델 파일(.task / .bin) 등록 런처
-    val modelPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            val fileName = getFileNameFromUri(context, uri)
-            coroutineScope.launch {
-                isCopyingModel = true
-                modelStatusText = "⏳ AI 모델을 앱 내부로 등록 중... (용량에 따라 10~20초 소요)"
-                val copiedPath = withContext(Dispatchers.IO) {
-                    copyModelToInternalStorage(context, uri)
-                }
-                isCopyingModel = false
-                if (copiedPath != null) {
-                    savedModelPath = copiedPath
-                    modelStatusText = "✅ AI 모델 등록 완료: $fileName"
-                    Toast.makeText(context, "AI 모델 등록이 완료되었습니다!", Toast.LENGTH_SHORT).show()
-                } else {
-                    modelStatusText = "❌ 모델 등록 실패 (저장공간 부족 또는 잘못된 파일)"
-                }
-            }
-        }
-    }
-
-    // [런처 1] PDF 파일 가져오기 런처
+    // PDF 파일 가져오기 런처
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -138,11 +95,11 @@ fun OfflinePdfTranslatorScreen() {
             selectedPdfUri = uri
             selectedFileName = getFileNameFromUri(context, uri)
             TranslationService.resetCompletion()
-            localStatus = "파일 준비 완료! 아래 버튼을 누르면 초벌 직역 후 AI 윤문하여 Download 폴더에 저장합니다."
+            localStatus = "파일 준비 완료! 아래 버튼을 누르면 초고속 번역 후 Download 폴더에 워드(.docx)로 저장됩니다."
         }
     }
 
-    val isProcessing = progressState.isRunning || isCopyingModel
+    val isProcessing = progressState.isRunning
     val displayStatus = if (progressState.isRunning || progressState.isCompleted) {
         progressState.statusMessage
     } else {
@@ -157,31 +114,17 @@ fun OfflinePdfTranslatorScreen() {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = "S24 울트라 AI 문서 번역기",
+            text = "초고속 오프라인 PDF 번역기",
             fontSize = 22.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(bottom = 24.dp)
+            modifier = Modifier.padding(bottom = 8.dp)
         )
 
-        // [버튼 0] 온디바이스 AI 모델 등록 (최초 1회)
-        OutlinedButton(
-            onClick = { modelPickerLauncher.launch(arrayOf("*/*")) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp),
-            enabled = !isProcessing
-        ) {
-            Text(
-                text = if (savedModelPath != null) "AI 모델 변경하기 (.task / .bin)" else "0. AI 모델 등록하기 (최초 1회)",
-                fontSize = 14.sp
-            )
-        }
-
         Text(
-            text = modelStatusText,
-            fontSize = 12.sp,
-            color = if (savedModelPath != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-            modifier = Modifier.padding(top = 6.dp, bottom = 20.dp)
+            text = "Google ML Kit 오프라인 정밀 번역 엔진",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 28.dp)
         )
 
         // [버튼 1] PDF 파일 가져오기
@@ -199,7 +142,7 @@ fun OfflinePdfTranslatorScreen() {
             text = "선택된 파일: $selectedFileName",
             fontSize = 13.sp,
             color = MaterialTheme.colorScheme.secondary,
-            modifier = Modifier.padding(top = 6.dp, bottom = 20.dp)
+            modifier = Modifier.padding(top = 8.dp, bottom = 24.dp)
         )
 
         // [언어 선택] 번역할 언어 (원본)
@@ -222,17 +165,11 @@ fun OfflinePdfTranslatorScreen() {
             onLanguageSelected = { targetLang = it }
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(28.dp))
 
-        // [버튼 2] 백그라운드 하이브리드 AI 번역 시작
+        // [버튼 2] 초고속 번역 시작
         Button(
             onClick = {
-                val modelPath = savedModelPath
-                if (modelPath == null) {
-                    Toast.makeText(context, "먼저 상단에서 AI 모델(.task/.bin)을 등록해 주세요.", Toast.LENGTH_LONG).show()
-                    return@Button
-                }
-
                 val uri = selectedPdfUri
                 if (uri == null) {
                     Toast.makeText(context, "먼저 PDF 파일을 가져와 주세요.", Toast.LENGTH_SHORT).show()
@@ -249,7 +186,6 @@ fun OfflinePdfTranslatorScreen() {
                 val serviceIntent = Intent(context, TranslationService::class.java).apply {
                     putExtra(TranslationService.EXTRA_PDF_URI, uri.toString())
                     putExtra(TranslationService.EXTRA_FILE_NAME, selectedFileName)
-                    putExtra(TranslationService.EXTRA_MODEL_PATH, modelPath)
                     putExtra(TranslationService.EXTRA_SOURCE_LANG, sourceLang.second)
                     putExtra(TranslationService.EXTRA_TARGET_LANG, targetLang.second)
                 }
@@ -259,15 +195,15 @@ fun OfflinePdfTranslatorScreen() {
             modifier = Modifier
                 .fillMaxWidth()
                 .height(54.dp),
-            enabled = !isProcessing && savedModelPath != null && selectedPdfUri != null
+            enabled = !isProcessing && selectedPdfUri != null
         ) {
             Text(
-                text = "2. AI 윤문 번역 시작 (워드 자동 저장)",
+                text = "2. 초고속 번역 시작 (워드 자동 저장)",
                 fontSize = 16.sp
             )
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         if (isProcessing) {
             if (progressState.totalPages > 0) {
@@ -308,20 +244,6 @@ fun getFileNameFromUri(context: Context, uri: Uri): String {
         }
     }
     return name
-}
-
-fun copyModelToInternalStorage(context: Context, uri: Uri): String? {
-    return try {
-        val destFile = File(context.filesDir, "llm_model.task")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(destFile).use { output ->
-                input.copyTo(output, bufferSize = 8192 * 4)
-            }
-        }
-        if (destFile.exists() && destFile.length() > 10_000_000L) destFile.absolutePath else null
-    } catch (e: Exception) {
-        null
-    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
