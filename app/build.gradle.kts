@@ -1,3 +1,4 @@
+```kotlin
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,8 +12,8 @@ android {
         applicationId = "com.example.offlinepdftranslator"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "3.0-Hybrid"
+        versionCode = 5
+        versionName = "3.1-PureGoogle"
         multiDexEnabled = true
     }
 
@@ -51,12 +52,13 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.multidex:multidex:2.0.1")
 
+    // 0단계 PDF 텍스트 추출용 (Android 내장 PdfRenderer + Google ML Kit 오프라인 문자 인식)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+
     // 1단계 초벌 직역용 오프라인 번역 엔진 (Google ML Kit)
     implementation("com.google.mlkit:translate:17.0.3")
 
     // 2단계 문맥·어순 윤문용 온디바이스 생성형 AI 엔진 (MediaPipe GenAI)
     implementation("com.google.mediapipe:tasks-genai:0.10.24")
-
-    // 오프라인 PDF 텍스트 추출 (PdfBox Android 안정 버전)
-    implementation("com.tom_roush:pdfbox-android:2.0.25.0")
 }
+```
