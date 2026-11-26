@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.offlinepdftranslator"
         minSdk = 24
         targetSdk = 34
-        versionCode = 5
-        versionName = "3.1-PureGoogle"
+        versionCode = 6
+        versionName = "4.0-PureMLKit"
         multiDexEnabled = true
     }
 
@@ -51,12 +51,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.multidex:multidex:2.0.1")
 
-    // 0단계 PDF 텍스트 추출용 (Android 내장 PdfRenderer + Google ML Kit 오프라인 문자 인식)
+    // 1단계 PDF 고해상도 텍스트 추출 (Android 내장 PdfRenderer + Google ML Kit 오프라인 문자 인식)
     implementation("com.google.mlkit:text-recognition:16.0.1")
 
-    // 1단계 초벌 직역용 오프라인 번역 엔진 (Google ML Kit)
+    // 2단계 초고속·고정밀 오프라인 번역 엔진 (Google ML Kit Translate 단독)
     implementation("com.google.mlkit:translate:17.0.3")
-
-    // 2단계 문맥·어순 윤문용 온디바이스 생성형 AI 엔진 (MediaPipe GenAI)
-    implementation("com.google.mediapipe:tasks-genai:0.10.24")
 }
