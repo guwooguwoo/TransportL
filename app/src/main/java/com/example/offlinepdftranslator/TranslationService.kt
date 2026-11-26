@@ -8,6 +8,10 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -21,8 +25,9 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -127,22 +132,35 @@ class TranslationService : Service() {
             }
 
             // =========================================================================
-            // 0단계: PDF 텍스트 추출 및 구조 분석
+            // 0단계: Android 순정 PdfRenderer + ML Kit OCR로 PDF 텍스트 정밀 추출
             // =========================================================================
             updateState(
                 isRunning = true,
-                statusMessage = "0단계: PDF 텍스트 추출 및 단락 구조 분석 중...",
+                statusMessage = "0단계: PDF 페이지 스캔 및 텍스트 추출 중...",
                 isCompleted = false,
                 fileName = fileName,
                 savedFilePath = ""
             )
-            updateNotification("PDF 구조 분석 중...", fileName, 0, 0, true)
+            updateNotification("0단계: PDF 텍스트 추출 중...", fileName, 0, 0, true)
 
-            val rawPages = extractPagesFromPdf(applicationContext, uri)
+            val rawPages = extractPagesUsingNativePdfRenderer(applicationContext, uri) { current, total ->
+                updateState(
+                    isRunning = true,
+                    statusMessage = "0단계: PDF 텍스트 인식 중... ($current / $total 페이지)"
+                )
+                updateNotification(
+                    title = "0단계: PDF 텍스트 추출 ($current/$total쪽)",
+                    content = fileName,
+                    progress = current,
+                    max = total,
+                    indeterminate = false
+                )
+            }
+
             if (rawPages.all { it.isBlank() }) {
                 updateState(
                     isRunning = false,
-                    statusMessage = "❌ 텍스트를 추출할 수 없습니다. (스캔된 이미지 PDF일 수 있습니다)"
+                    statusMessage = "❌ PDF에서 텍스트를 인식할 수 없습니다."
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 updateNotification("번역 실패", "텍스트를 추출할 수 없는 PDF입니다.", 0, 0, false, ongoing = false)
@@ -175,7 +193,6 @@ class TranslationService : Service() {
                 .build()
             mlKitTranslator = Translation.getClient(translatorOptions)
 
-            // 기기에 언어팩이 없을 경우 최초 1회 자동 다운로드
             val conditions = DownloadConditions.Builder().build()
             mlKitTranslator.downloadModelIfNeeded(conditions).awaitTask()
 
@@ -215,7 +232,6 @@ class TranslationService : Service() {
                 draftPages.add(draftPageUnits)
             }
 
-            // 1단계 완료 후 ML Kit 메모리 즉시 해제
             mlKitTranslator.close()
             mlKitTranslator = null
 
@@ -274,7 +290,6 @@ class TranslationService : Service() {
                         indeterminate = false
                     )
 
-                    // 4단어 이하의 아주 짧은 제목이나 숫자는 초벌 번역문 그대로 유지 (속도 향상 및 왜곡 방지)
                     val wordCount = draftText.trim().split(Regex("\\s+")).size
                     val polishedText = if (!draftText.any { it.isLetter() } || wordCount <= 3) {
                         draftText
@@ -361,10 +376,57 @@ class TranslationService : Service() {
     }
 
     /**
-     * 2단계 전용: 초벌 직역문(draftText)의 어색한 직역투와 어순만 자연스러운 모국어 문맥으로 다듬는 프롬프트
-     * - 원문을 다시 해석하지 않고 초벌 번역문만 교정하므로 속도가 빠르고 누락이 없습니다.
-     * - AI가 교정에 실패하거나 이상한 문장을 뱉으면 안전하게 1단계 초벌 번역문(draftText)으로 자동 복구합니다.
+     * 외부 라이브러리 없이 Android 내장 PdfRenderer와 Google ML Kit 온디바이스 문자 인식으로
+     * 일반 PDF 및 스캔본 PDF의 문단/줄 구조를 정확히 추출합니다.
      */
+    private suspend fun extractPagesUsingNativePdfRenderer(
+        context: Context,
+        uri: Uri,
+        onPageProgress: (current: Int, total: Int) -> Unit
+    ): List<String> {
+        val pages = mutableListOf<String>()
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+        try {
+            val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return emptyList()
+            pfd.use { descriptor ->
+                PdfRenderer(descriptor).use { renderer ->
+                    val pageCount = renderer.pageCount
+                    for (i in 0 until pageCount) {
+                        onPageProgress(i + 1, pageCount)
+                        renderer.openPage(i).use { page ->
+                            // 고해상도(2배 스케일)로 렌더링하여 작은 글씨도 100% 정확히 인식
+                            val width = (page.width * 2).coerceAtMost(2400)
+                            val height = (page.height * 2).coerceAtMost(3400)
+                            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                            try {
+                                val canvas = Canvas(bitmap)
+                                canvas.drawColor(Color.WHITE)
+                                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                                val image = InputImage.fromBitmap(bitmap, 0)
+                                val visionText = recognizer.process(image).awaitTask()
+
+                                // 블록(문단) 단위로 줄바꿈(\n\n)을 유지하며 추출
+                                val pageBuilder = StringBuilder()
+                                for (block in visionText.textBlocks) {
+                                    if (pageBuilder.isNotEmpty()) pageBuilder.append("\n\n")
+                                    pageBuilder.append(block.text)
+                                }
+                                pages.add(pageBuilder.toString())
+                            } finally {
+                                bitmap.recycle()
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            recognizer.close()
+        }
+        return pages
+    }
+
     private fun polishDraftWithLlm(
         llm: LlmInference,
         draftText: String,
@@ -399,7 +461,6 @@ class TranslationService : Service() {
             .replace(Regex("^(Natural:|Draft:|Rewritten:|교정:|수정:)\\s*", RegexOption.IGNORE_CASE), "")
             .trim()
 
-        // AI 거절 멘트 감지 시 초벌 번역본 유지
         if (cleaned.contains("번역 기능은") ||
             cleaned.contains("지원되지 않") ||
             cleaned.contains("수정을 원하시면") ||
@@ -415,7 +476,6 @@ class TranslationService : Service() {
             .replace(Regex("\\s{2,}"), " ")
             .trim()
 
-        // 길이 검증: 윤문 결과가 초벌 번역본보다 비정상적으로 짧아졌거나(내용 누락) 2배 이상 길어졌으면(헛소리 추가) 초벌본으로 안전 복구
         if (cleaned.length < fallbackDraft.length * 0.45 || cleaned.length > fallbackDraft.length * 2.0) {
             return fallbackDraft
         }
@@ -472,38 +532,30 @@ class TranslationService : Service() {
 
     private fun parseSmartLayoutUnits(pageText: String, maxUnitChars: Int): List<Pair<String, Boolean>> {
         val units = mutableListOf<Pair<String, Boolean>>()
-        val lines = pageText.lines()
-        val bodyBuffer = StringBuilder()
+        val blocks = pageText.split(Regex("\\n{2,}"))
 
-        for (line in lines) {
-            val trimmed = line.trim()
+        for (block in blocks) {
+            val lines = block.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            if (lines.isEmpty()) continue
 
-            if (trimmed.isEmpty()) {
-                if (bodyBuffer.isNotEmpty()) {
-                    addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
-                    bodyBuffer.clear()
+            // 블록 내 줄들이 목차 줄인지 확인
+            val isTocBlock = lines.all { it.matches(Regex(".*(\\.{2,}|\\s+|·)\\d{1,4}$")) }
+            if (isTocBlock) {
+                for (line in lines) {
+                    units.add(line to false)
                 }
                 continue
             }
 
-            val isTocLine = trimmed.matches(Regex(".*(\\.{2,}|\\s+|·)\\d{1,4}$"))
-            val isHeadingLine = !isTocLine && trimmed.length < 60 &&
-                    !trimmed.endsWith(".") && !trimmed.endsWith("?") && !trimmed.endsWith("!") && !trimmed.endsWith(",")
+            val joinedBlock = lines.joinToString(" ")
+            val isHeading = joinedBlock.length < 60 &&
+                    !joinedBlock.endsWith(".") && !joinedBlock.endsWith("?") && !joinedBlock.endsWith("!") && !joinedBlock.endsWith(",")
 
-            if (isTocLine || isHeadingLine) {
-                if (bodyBuffer.isNotEmpty()) {
-                    addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
-                    bodyBuffer.clear()
-                }
-                units.add(trimmed to isHeadingLine)
+            if (isHeading) {
+                units.add(joinedBlock to true)
             } else {
-                if (bodyBuffer.isNotEmpty()) bodyBuffer.append(" ")
-                bodyBuffer.append(trimmed)
+                addSplitBodyUnits(units, joinedBlock, maxUnitChars)
             }
-        }
-
-        if (bodyBuffer.isNotEmpty()) {
-            addSplitBodyUnits(units, bodyBuffer.toString().trim(), maxUnitChars)
         }
 
         return units
@@ -659,24 +711,6 @@ fun cleanEnglishPdfNoise(rawText: String): String {
     }
 
     return filteredLines.joinToString("\n")
-}
-
-fun extractPagesFromPdf(context: Context, uri: Uri): List<String> {
-    val pages = mutableListOf<String>()
-    context.contentResolver.openInputStream(uri)?.use { inputStream ->
-        PDDocument.load(inputStream).use { document ->
-            val stripper = PDFTextStripper().apply {
-                sortByPosition = true
-                paragraphEnd = "\n\n"
-            }
-            for (pageNum in 1..document.numberOfPages) {
-                stripper.startPage = pageNum
-                stripper.endPage = pageNum
-                pages.add(stripper.getText(document))
-            }
-        }
-    }
-    return pages
 }
 
 fun saveDocxToDownloads(
