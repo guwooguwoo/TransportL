@@ -19,7 +19,6 @@ import android.os.IBinder
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.tasks.Task
-import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
@@ -47,7 +46,7 @@ data class TranslatedParagraph(
 
 data class TranslationProgressState(
     val isRunning: Boolean = false,
-    val statusMessage: String = "AI 모델(.task/.bin)과 PDF 파일을 선택해 주세요.",
+    val statusMessage: String = "PDF 파일을 선택해 주세요.",
     val currentPage: Int = 0,
     val totalPages: Int = 0,
     val isCompleted: Boolean = false,
@@ -61,19 +60,16 @@ class TranslationService : Service() {
     private lateinit var notificationManager: NotificationManager
 
     companion object {
-        const val CHANNEL_ID = "pdf_llm_translation_channel"
+        const val CHANNEL_ID = "pdf_mlkit_translation_channel"
         const val NOTIFICATION_ID = 1002
 
         const val EXTRA_PDF_URI = "extra_pdf_uri"
         const val EXTRA_FILE_NAME = "extra_file_name"
-        const val EXTRA_MODEL_PATH = "extra_model_path"
         const val EXTRA_SOURCE_LANG = "extra_source_lang"
         const val EXTRA_TARGET_LANG = "extra_target_lang"
 
         private val _progressState = MutableStateFlow(TranslationProgressState())
         val progressState = _progressState.asStateFlow()
-
-        var completedPages: List<List<TranslatedParagraph>> = emptyList()
 
         fun resetCompletion() {
             _progressState.value = _progressState.value.copy(
@@ -92,7 +88,6 @@ class TranslationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val uriString = intent?.getStringExtra(EXTRA_PDF_URI) ?: return START_NOT_STICKY
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "document.pdf"
-        val modelPath = intent.getStringExtra(EXTRA_MODEL_PATH) ?: return START_NOT_STICKY
         val sourceLang = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: "English"
         val targetLang = intent.getStringExtra(EXTRA_TARGET_LANG) ?: "Russian"
 
@@ -100,56 +95,46 @@ class TranslationService : Service() {
 
         startForeground(
             NOTIFICATION_ID,
-            buildNotification("하이브리드 AI 번역 준비 중...", "초벌 엔진과 AI 윤문 엔진을 준비합니다.", 0, 0, true)
+            buildNotification("초고속 PDF 번역 준비 중...", "언어 엔진을 준비하고 있습니다.", 0, 0, true)
         )
 
         serviceScope.launch {
-            runHybridTranslationTask(pdfUri, fileName, modelPath, sourceLang, targetLang)
+            runPureMlKitTranslationTask(pdfUri, fileName, sourceLang, targetLang)
         }
 
         return START_NOT_STICKY
     }
 
-    private suspend fun runHybridTranslationTask(
+    private suspend fun runPureMlKitTranslationTask(
         uri: Uri,
         fileName: String,
-        modelPath: String,
         sourceLang: String,
         targetLang: String
     ) {
         var mlKitTranslator: Translator? = null
-        var llmInference: LlmInference? = null
 
         try {
-            val modelFile = File(modelPath)
-            if (!modelFile.exists()) {
-                updateState(
-                    isRunning = false,
-                    statusMessage = "❌ AI 모델 파일을 찾을 수 없습니다. 다시 선택해 주세요."
-                )
-                stopSelf()
-                return
-            }
-
             // =========================================================================
-            // 0단계: Android 순정 PdfRenderer + ML Kit OCR로 PDF 텍스트 정밀 추출
+            // 1단계: 고해상도 PDF 렌더링 + 상하단 머리말/꼬리말(러닝헤드) 제외 본문 정밀 추출
             // =========================================================================
             updateState(
                 isRunning = true,
-                statusMessage = "0단계: PDF 페이지 스캔 및 텍스트 추출 중...",
+                statusMessage = "1단계: PDF 페이지 고해상도 스캔 및 본문 추출 중...",
                 isCompleted = false,
                 fileName = fileName,
                 savedFilePath = ""
             )
-            updateNotification("0단계: PDF 텍스트 추출 중...", fileName, 0, 0, true)
+            updateNotification("1단계: PDF 텍스트 추출 중...", fileName, 0, 0, true)
 
-            val rawPages = extractPagesUsingNativePdfRenderer(applicationContext, uri) { current, total ->
+            val rawPages = extractCleanBodyPagesFromPdf(applicationContext, uri) { current, total ->
                 updateState(
                     isRunning = true,
-                    statusMessage = "0단계: PDF 텍스트 인식 중... ($current / $total 페이지)"
+                    statusMessage = "1단계: PDF 고해상도 텍스트 추출 중... ($current / $total 페이지)",
+                    currentPage = current,
+                    totalPages = total
                 )
                 updateNotification(
-                    title = "0단계: PDF 텍스트 추출 ($current/${total}쪽)",
+                    title = "1단계: PDF 텍스트 추출 ($current/${total}쪽)",
                     content = fileName,
                     progress = current,
                     max = total,
@@ -170,20 +155,20 @@ class TranslationService : Service() {
 
             val allParsedPages = rawPages.map { pageText ->
                 val cleanedText = cleanEnglishPdfNoise(pageText)
-                parseSmartLayoutUnits(cleanedText, maxUnitChars = 420)
+                parseSmartLayoutUnits(cleanedText)
             }
 
             val totalPages = allParsedPages.size
             val totalUnitsAll = allParsedPages.sumOf { it.size }.coerceAtLeast(1)
 
             // =========================================================================
-            // 1단계: Google ML Kit 초고속 초벌 직역 (단어 누락 방지 및 전체 직역본 확보)
+            // 2단계: Google ML Kit 오프라인 초고속 정밀 번역 (지명/내용 왜곡 없음)
             // =========================================================================
             updateState(
                 isRunning = true,
-                statusMessage = "1단계: 초벌 번역 엔진 준비 중... (오프라인 언어팩 확인)"
+                statusMessage = "2단계: 오프라인 번역 언어팩 준비 중... (최초 1회만 다운로드)"
             )
-            updateNotification("1단계: 초벌 번역 준비 중...", "언어팩을 확인하고 있습니다.", 0, totalUnitsAll, true)
+            updateNotification("2단계: 번역 언어팩 확인 중...", "잠시만 기다려 주세요.", 0, totalUnitsAll, true)
 
             val mlKitSrc = mapToMlKitLanguage(sourceLang)
             val mlKitTgt = mapToMlKitLanguage(targetLang)
@@ -196,29 +181,32 @@ class TranslationService : Service() {
             val conditions = DownloadConditions.Builder().build()
             mlKitTranslator.downloadModelIfNeeded(conditions).awaitTask()
 
-            val draftPages = mutableListOf<List<Pair<String, Boolean>>>()
-            var draftCount = 0
+            val finalResultPages = mutableListOf<List<TranslatedParagraph>>()
+            var processedCount = 0
 
             for ((pageIdx, pageUnits) in allParsedPages.withIndex()) {
-                val draftPageUnits = mutableListOf<Pair<String, Boolean>>()
+                val translatedPageParagraphs = mutableListOf<TranslatedParagraph>()
+
                 for ((rawUnit, isHeading) in pageUnits) {
-                    draftCount++
-                    if (draftCount % 10 == 0 || draftCount == totalUnitsAll) {
-                        val draftPercent = ((draftCount.toFloat() / totalUnitsAll) * 100).toInt()
+                    processedCount++
+                    if (processedCount % 5 == 0 || processedCount == totalUnitsAll) {
+                        val percent = ((processedCount.toFloat() / totalUnitsAll) * 100).toInt()
                         updateState(
                             isRunning = true,
-                            statusMessage = "1단계: 초벌 직역본 생성 중... $draftPercent% (${pageIdx + 1}/${totalPages}쪽)"
+                            statusMessage = "2단계: 초고속 정밀 번역 중... $percent% (${pageIdx + 1}/${totalPages}쪽)",
+                            currentPage = processedCount,
+                            totalPages = totalUnitsAll
                         )
                         updateNotification(
-                            title = "1단계: 초벌 직역 중 ($draftPercent%)",
-                            content = "${pageIdx + 1}/${totalPages}쪽 초벌 직역 진행 중...",
-                            progress = draftCount,
+                            title = "초고속 정밀 번역 중 ($percent%)",
+                            content = "${pageIdx + 1}/${totalPages}쪽 번역 진행 중...",
+                            progress = processedCount,
                             max = totalUnitsAll,
                             indeterminate = false
                         )
                     }
 
-                    val draftText = if (!rawUnit.any { it.isLetter() }) {
+                    val translatedText = if (!rawUnit.any { it.isLetter() }) {
                         rawUnit
                     } else {
                         try {
@@ -227,116 +215,30 @@ class TranslationService : Service() {
                             rawUnit
                         }
                     }
-                    draftPageUnits.add(draftText to isHeading)
+
+                    translatedPageParagraphs.add(
+                        TranslatedParagraph(
+                            text = translatedText.trim(),
+                            isHeading = isHeading
+                        )
+                    )
                 }
-                draftPages.add(draftPageUnits)
+                finalResultPages.add(translatedPageParagraphs)
             }
 
             mlKitTranslator.close()
             mlKitTranslator = null
 
             // =========================================================================
-            // 2단계: Qwen2.5 온디바이스 AI로 초벌 번역문의 어순 및 문맥 자연스럽게 다듬기
-            // =========================================================================
-            updateState(
-                isRunning = true,
-                statusMessage = "2단계: AI 문맥·어순 윤문 엔진 로딩 중... (총 ${totalPages}쪽, ${totalUnitsAll}개 항목)"
-            )
-            updateNotification("2단계: AI 윤문 엔진 로딩 중...", "초벌 번역본의 문맥을 다듬을 준비 중입니다.", 0, totalUnitsAll, true)
-
-            llmInference = try {
-                val gpuOptions = LlmInference.LlmInferenceOptions.builder()
-                    .setModelPath(modelPath)
-                    .setMaxTokens(1024)
-                    .setPreferredBackend(LlmInference.Backend.GPU)
-                    .build()
-                LlmInference.createFromOptions(applicationContext, gpuOptions)
-            } catch (gpuEx: Throwable) {
-                val defaultOptions = LlmInference.LlmInferenceOptions.builder()
-                    .setModelPath(modelPath)
-                    .setMaxTokens(1024)
-                    .build()
-                LlmInference.createFromOptions(applicationContext, defaultOptions)
-            }
-
-            var polishedUnitsCount = 0
-            val finalResultPages = mutableListOf<List<TranslatedParagraph>>()
-
-            for ((pageIdx, draftPageUnits) in draftPages.withIndex()) {
-                val currentPageNum = pageIdx + 1
-                val polishedPageParagraphs = mutableListOf<TranslatedParagraph>()
-
-                if (draftPageUnits.isEmpty()) {
-                    finalResultPages.add(emptyList())
-                    continue
-                }
-
-                for ((unitIdx, pair) in draftPageUnits.withIndex()) {
-                    val (draftText, isHeading) = pair
-                    val percent = ((polishedUnitsCount.toFloat() / totalUnitsAll) * 100).toInt()
-                    val statusDetail = "2단계 AI 문맥·어순 윤문 중: $percent% ($currentPageNum/${totalPages}쪽 · 항목 ${unitIdx + 1}/${draftPageUnits.size})"
-
-                    updateState(
-                        isRunning = true,
-                        statusMessage = statusDetail,
-                        currentPage = polishedUnitsCount,
-                        totalPages = totalUnitsAll
-                    )
-                    updateNotification(
-                        title = "2단계: AI 문맥·어순 다듬기 ($percent%)",
-                        content = "$currentPageNum/${totalPages}쪽 · 항목 ${unitIdx + 1}/${draftPageUnits.size} 교정 중...",
-                        progress = polishedUnitsCount,
-                        max = totalUnitsAll,
-                        indeterminate = false
-                    )
-
-                    val wordCount = draftText.trim().split(Regex("\\s+")).size
-                    val polishedText = if (!draftText.any { it.isLetter() } || wordCount <= 3) {
-                        draftText
-                    } else {
-                        polishDraftWithLlm(
-                            llm = llmInference!!,
-                            draftText = draftText,
-                            targetLang = targetLang
-                        )
-                    }
-
-                    val finalLines = polishedText.ifBlank { draftText }
-                        .replace("\\n", "\n")
-                        .split(Regex("\\n+"))
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
-
-                    if (finalLines.isEmpty()) {
-                        polishedPageParagraphs.add(TranslatedParagraph(draftText, isHeading))
-                    } else {
-                        finalLines.forEachIndexed { idx, lineText ->
-                            polishedPageParagraphs.add(
-                                TranslatedParagraph(
-                                    text = lineText,
-                                    isHeading = isHeading && idx == 0
-                                )
-                            )
-                        }
-                    }
-
-                    polishedUnitsCount++
-                }
-                finalResultPages.add(polishedPageParagraphs)
-            }
-
-            completedPages = finalResultPages
-
-            // =========================================================================
             // 3단계: 내장 메모리 Download 폴더에 워드(.docx) 파일 자동 저장
             // =========================================================================
             val baseName = fileName.substringBeforeLast(".")
-            val outputDocxName = "${baseName}_${targetLang}_AI윤문번역본.docx"
+            val outputDocxName = "${baseName}_${targetLang}_번역본.docx"
             val savedLocation = saveDocxToDownloads(applicationContext, outputDocxName, finalResultPages)
 
             updateState(
                 isRunning = false,
-                statusMessage = "✅ 초벌 직역 + AI 문맥 윤문 완료 및 워드 자동 저장됨!\n저장 위치: $savedLocation",
+                statusMessage = "✅ 초고속 번역 완료 및 워드(.docx) 자동 저장됨!\n저장 위치: $savedLocation",
                 currentPage = totalUnitsAll,
                 totalPages = totalUnitsAll,
                 isCompleted = true,
@@ -346,7 +248,7 @@ class TranslationService : Service() {
 
             stopForeground(STOP_FOREGROUND_DETACH)
             updateNotification(
-                title = "✅ 워드(.docx) 윤문 번역 저장 완료 (100%)",
+                title = "✅ 워드(.docx) 번역 저장 완료 (100%)",
                 content = "다운로드 폴더에 '$outputDocxName' 저장 완료!",
                 progress = totalUnitsAll,
                 max = totalUnitsAll,
@@ -368,18 +270,14 @@ class TranslationService : Service() {
                 mlKitTranslator?.close()
             } catch (_: Throwable) {
             }
-            try {
-                llmInference?.close()
-            } catch (_: Throwable) {
-            }
         }
     }
 
     /**
-     * 외부 라이브러리 없이 Android 내장 PdfRenderer와 Google ML Kit 온디바이스 문자 인식으로
-     * 일반 PDF 및 스캔본 PDF의 문단/줄 구조를 정확히 추출합니다.
+     * 페이지 상단 6% 및 하단 7% 영역(책 제목 러닝헤드 및 페이지 번호)을 자동으로 걸러내고
+     * 초고해상도(2.5배) 렌더링으로 철자 오인식(OCR 오타)을 최소화하여 추출합니다.
      */
-    private suspend fun extractPagesUsingNativePdfRenderer(
+    private suspend fun extractCleanBodyPagesFromPdf(
         context: Context,
         uri: Uri,
         onPageProgress: (current: Int, total: Int) -> Unit
@@ -395,9 +293,8 @@ class TranslationService : Service() {
                     for (i in 0 until pageCount) {
                         onPageProgress(i + 1, pageCount)
                         renderer.openPage(i).use { page ->
-                            // 고해상도(2배 스케일)로 렌더링하여 작은 글씨도 100% 정확히 인식
-                            val width = (page.width * 2).coerceAtMost(2400)
-                            val height = (page.height * 2).coerceAtMost(3400)
+                            val width = (page.width * 2.5f).toInt().coerceAtMost(2800)
+                            val height = (page.height * 2.5f).toInt().coerceAtMost(3800)
                             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                             try {
                                 val canvas = Canvas(bitmap)
@@ -407,9 +304,20 @@ class TranslationService : Service() {
                                 val image = InputImage.fromBitmap(bitmap, 0)
                                 val visionText = recognizer.process(image).awaitTask()
 
-                                // 블록(문단) 단위로 줄바꿈(\n\n)을 유지하며 추출
+                                // 머리말(상단 6%)과 꼬리말/페이지번호(하단 7%) 좌표 필터링
+                                val topMarginLimit = height * 0.06f
+                                val bottomMarginLimit = height * 0.93f
+
+                                val sortedBlocks = visionText.textBlocks
+                                    .filter { block ->
+                                        val box = block.boundingBox
+                                        if (box == null) true
+                                        else box.bottom > topMarginLimit && box.top < bottomMarginLimit
+                                    }
+                                    .sortedBy { it.boundingBox?.top ?: 0 }
+
                                 val pageBuilder = StringBuilder()
-                                for (block in visionText.textBlocks) {
+                                for (block in sortedBlocks) {
                                     if (pageBuilder.isNotEmpty()) pageBuilder.append("\n\n")
                                     pageBuilder.append(block.text)
                                 }
@@ -425,88 +333,6 @@ class TranslationService : Service() {
             recognizer.close()
         }
         return pages
-    }
-
-    private fun polishDraftWithLlm(
-        llm: LlmInference,
-        draftText: String,
-        targetLang: String
-    ): String {
-        val examplePair = when (targetLang) {
-            "Korean" -> "Draft: 그는 결정했다 떠나기로 그의 집을, 왜냐하면 비가 오고 있었기 때문에.\nNatural: 비가 오고 있었기 때문에 그는 집을 떠나기로 결정했다.\n\n"
-            "Russian" -> "Draft: Он решил покинуть его дом, потому что дождь шел.\nNatural: Он решил уйти из дома, так как шёл дождь.\n\n"
-            "Vietnamese" -> "Draft: Anh ấy đã quyết định rời khỏi ngôi nhà của anh ấy bởi vì trời đang mưa.\nNatural: Vì trời đang mưa nên anh ấy quyết định rời khỏi nhà.\n\n"
-            else -> ""
-        }
-
-        val prompt = buildString {
-            append("<|im_start|>user\n")
-            append("Rewrite the following $targetLang draft so that the word order and phrasing sound completely natural, keeping the exact meaning and numbers. Output ONLY the rewritten text.\n\n")
-            append(examplePair)
-            append("Draft: $draftText\n")
-            append("Natural:<|im_end|>\n")
-            append("<|im_start|>assistant\n")
-        }
-
-        val rawResponse = llm.generateResponse(prompt)
-        return sanitizeAndVerifyPolishedOutput(rawResponse, draftText)
-    }
-
-    private fun sanitizeAndVerifyPolishedOutput(raw: String, fallbackDraft: String): String {
-        var cleaned = raw
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .replace("\\n", " ")
-            .replace("\n", " ")
-            .replace(Regex("^(Natural:|Draft:|Rewritten:|교정:|수정:)\\s*", RegexOption.IGNORE_CASE), "")
-            .trim()
-
-        if (cleaned.contains("번역 기능은") ||
-            cleaned.contains("지원되지 않") ||
-            cleaned.contains("수정을 원하시면") ||
-            cleaned.isBlank()
-        ) {
-            return fallbackDraft
-        }
-
-        cleaned = repairBrokenBpeUtf8(cleaned)
-            .replace("Â·", " · ")
-            .replace("Â", "")
-            .replace(Regex("[Ġìłĥį¶«ªİığşç]"), "")
-            .replace(Regex("\\s{2,}"), " ")
-            .trim()
-
-        if (cleaned.length < fallbackDraft.length * 0.45 || cleaned.length > fallbackDraft.length * 2.0) {
-            return fallbackDraft
-        }
-
-        return cleaned
-    }
-
-    private fun repairBrokenBpeUtf8(input: String): String {
-        return try {
-            val normalized = input.replace('Ġ', ' ')
-            val sb = StringBuilder()
-            var i = 0
-            while (i < normalized.length) {
-                val c1 = normalized[i].code
-                if (c1 in 0xEA..0xED && i + 2 < normalized.length) {
-                    val c2 = normalized[i + 1].code
-                    val c3 = normalized[i + 2].code
-                    if (c2 in 0x80..0xBF && c3 in 0x80..0xBF) {
-                        val bytes = byteArrayOf(c1.toByte(), c2.toByte(), c3.toByte())
-                        sb.append(String(bytes, StandardCharsets.UTF_8))
-                        i += 3
-                        continue
-                    }
-                }
-                sb.append(normalized[i])
-                i++
-            }
-            sb.toString()
-        } catch (_: Exception) {
-            input
-        }
     }
 
     private fun mapToMlKitLanguage(langName: String): String {
@@ -530,7 +356,7 @@ class TranslationService : Service() {
         addOnFailureListener { exception -> cont.resumeWithException(exception) }
     }
 
-    private fun parseSmartLayoutUnits(pageText: String, maxUnitChars: Int): List<Pair<String, Boolean>> {
+    private fun parseSmartLayoutUnits(pageText: String): List<Pair<String, Boolean>> {
         val units = mutableListOf<Pair<String, Boolean>>()
         val blocks = pageText.split(Regex("\\n{2,}"))
 
@@ -538,7 +364,6 @@ class TranslationService : Service() {
             val lines = block.lines().map { it.trim() }.filter { it.isNotEmpty() }
             if (lines.isEmpty()) continue
 
-            // 블록 내 줄들이 목차 줄인지 확인
             val isTocBlock = lines.all { it.matches(Regex(".*(\\.{2,}|\\s+|·)\\d{1,4}$")) }
             if (isTocBlock) {
                 for (line in lines) {
@@ -551,55 +376,10 @@ class TranslationService : Service() {
             val isHeading = joinedBlock.length < 60 &&
                     !joinedBlock.endsWith(".") && !joinedBlock.endsWith("?") && !joinedBlock.endsWith("!") && !joinedBlock.endsWith(",")
 
-            if (isHeading) {
-                units.add(joinedBlock to true)
-            } else {
-                addSplitBodyUnits(units, joinedBlock, maxUnitChars)
-            }
+            units.add(joinedBlock to isHeading)
         }
 
         return units
-    }
-
-    private fun addSplitBodyUnits(
-        targetList: MutableList<Pair<String, Boolean>>,
-        paragraph: String,
-        maxChars: Int
-    ) {
-        if (paragraph.length <= maxChars) {
-            targetList.add(paragraph to false)
-            return
-        }
-
-        val sentences = paragraph.split(Regex("(?<=[.?!][\"'”’)\\]]?)\\s+"))
-        val chunkBuffer = StringBuilder()
-
-        for (sentence in sentences) {
-            if (sentence.length > maxChars) {
-                if (chunkBuffer.isNotEmpty()) {
-                    targetList.add(chunkBuffer.toString().trim() to false)
-                    chunkBuffer.clear()
-                }
-                var idx = 0
-                while (idx < sentence.length) {
-                    val end = (idx + maxChars).coerceAtMost(sentence.length)
-                    targetList.add(sentence.substring(idx, end).trim() to false)
-                    idx = end
-                }
-                continue
-            }
-
-            if (chunkBuffer.isNotEmpty() && chunkBuffer.length + sentence.length > maxChars) {
-                targetList.add(chunkBuffer.toString().trim() to false)
-                chunkBuffer.clear()
-            }
-            if (chunkBuffer.isNotEmpty()) chunkBuffer.append(" ")
-            chunkBuffer.append(sentence)
-        }
-
-        if (chunkBuffer.isNotEmpty()) {
-            targetList.add(chunkBuffer.toString().trim() to false)
-        }
     }
 
     private fun updateState(
@@ -674,10 +454,10 @@ class TranslationService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "AI PDF 오프라인 번역 진행률",
+                "오프라인 PDF 번역 진행률",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "백그라운드에서 진행 중인 온디바이스 AI PDF 번역 상태를 표시합니다."
+                description = "백그라운드에서 진행 중인 오프라인 PDF 번역 상태를 표시합니다."
             }
             notificationManager.createNotificationChannel(channel)
         }
