@@ -24,7 +24,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -34,7 +33,6 @@ import java.io.FileOutputStream
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        PDFBoxResourceLoader.init(applicationContext)
 
         setContent {
             MaterialTheme {
@@ -140,7 +138,7 @@ fun OfflinePdfTranslatorScreen() {
             selectedPdfUri = uri
             selectedFileName = getFileNameFromUri(context, uri)
             TranslationService.resetCompletion()
-            localStatus = "파일 준비 완료! 아래 버튼을 누르면 번역 후 Download 폴더에 워드(.docx)로 자동 저장됩니다."
+            localStatus = "파일 준비 완료! 아래 버튼을 누르면 초벌 직역 후 AI 윤문하여 Download 폴더에 저장합니다."
         }
     }
 
@@ -226,7 +224,7 @@ fun OfflinePdfTranslatorScreen() {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // [버튼 2] 백그라운드 AI 번역 시작 (완료 즉시 Download 폴더에 워드 자동 저장)
+        // [버튼 2] 백그라운드 하이브리드 AI 번역 시작
         Button(
             onClick = {
                 val modelPath = savedModelPath
@@ -264,7 +262,7 @@ fun OfflinePdfTranslatorScreen() {
             enabled = !isProcessing && savedModelPath != null && selectedPdfUri != null
         ) {
             Text(
-                text = "2. AI 번역 시작 (워드 자동 저장)",
+                text = "2. AI 윤문 번역 시작 (워드 자동 저장)",
                 fontSize = 16.sp
             )
         }
